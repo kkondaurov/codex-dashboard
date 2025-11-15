@@ -56,6 +56,10 @@ impl UsageAggregatorHandle {
         let _ = self.join.await;
     }
 
+    pub async fn wait(self) {
+        let _ = self.join.await;
+    }
+
     #[allow(dead_code)]
     pub fn recent_events(&self) -> RecentEvents {
         self.recent_events.clone()
@@ -197,7 +201,7 @@ mod tests {
 
         tx.send(event.clone()).await.unwrap();
         drop(tx);
-        handle.shutdown().await;
+        handle.wait().await;
 
         let day = event.timestamp.date_naive();
         let totals = storage.totals_between(day, day).await.unwrap();

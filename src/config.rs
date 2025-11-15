@@ -272,6 +272,8 @@ fn default_model_pricing() -> HashMap<String, ModelPricing> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{env, fs, path::PathBuf};
+    use tempfile::NamedTempFile;
 
     #[test]
     fn cost_for_known_model_uses_specific_rates() {
@@ -288,5 +290,75 @@ mod tests {
         config.pricing.default_completion_per_1k = 0.1;
         let cost = config.pricing.cost_for("unknown-model", 1000, 1000);
         assert!((cost - 0.15).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn load_from_file_applies_overrides() {
+        let file = NamedTempFile::new().unwrap();
+        let toml = r#"
+            [server]
+            listen_addr = "0.0.0.0:9999"
+            upstream_base_url = "https://example.com/v9"
+
+            [storage]
+            database_path = "custom.db"
+
+            [display]
+            recent_events_capacity = 77
+
+            [pricing.models.test]
+            prompt_per_1k = 0.001
+            completion_per_1k = 0.003
+        "#;
+        fs::write(file.path(), toml).unwrap();
+
+        let config = AppConfig::load(Some(file.path())).unwrap();
+        assert_eq!(config.server.listen_addr, "0.0.0.0:9999");
+        assert_eq!(config.storage.database_path, PathBuf::from("custom.db"));
+        assert_eq!(config.display.recent_events_capacity, 77);
+
+        let cost = config.pricing.cost_for("test", 1000, 1000);
+        assert!((cost - 0.004).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn env_overrides_take_precedence() {
+        let _listen_guard = EnvGuard::set("CODEX_USAGE_LISTEN_ADDR", "127.0.0.1:7000");
+        let _db_guard = EnvGuard::set("CODEX_USAGE_DB_PATH", "/tmp/codex-test.db");
+        let _base_guard = EnvGuard::set("OPENAI_BASE_URL", "https://proxy.example.com/v3");
+
+        let config = AppConfig::load(None).unwrap();
+        assert_eq!(config.server.listen_addr, "127.0.0.1:7000");
+        assert_eq!(
+            config.storage.database_path,
+            PathBuf::from("/tmp/codex-test.db")
+        );
+        assert_eq!(
+            config.server.upstream_base_url,
+            "https://proxy.example.com/v3"
+        );
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var(key).ok();
+            unsafe { env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(ref value) = self.previous {
+                unsafe { env::set_var(self.key, value) };
+            } else {
+                unsafe { env::remove_var(self.key) };
+            }
+        }
     }
 }
