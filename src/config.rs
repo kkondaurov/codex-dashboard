@@ -1,0 +1,263 @@
+#![allow(dead_code)]
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::{
+    collections::HashMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub display: DisplayConfig,
+    #[serde(default)]
+    pub pricing: PricingConfig,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            server: ServerConfig::default(),
+            storage: StorageConfig::default(),
+            display: DisplayConfig::default(),
+            pricing: PricingConfig::default(),
+        }
+    }
+}
+
+impl AppConfig {
+    pub fn load(path: Option<&Path>) -> Result<Self> {
+        let mut config = if let Some(path) = path {
+            Self::from_file(path)?
+        } else {
+            let default_path = PathBuf::from("codex-usage.toml");
+            if default_path.exists() {
+                Self::from_file(&default_path)?
+            } else {
+                Self::default()
+            }
+        };
+
+        config.apply_env_overrides();
+        Ok(config)
+    }
+
+    fn from_file(path: &Path) -> Result<Self> {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?;
+        let config: Self =
+            toml::from_str(&contents).with_context(|| "failed to parse configuration TOML")?;
+        Ok(config)
+    }
+
+    fn apply_env_overrides(&mut self) {
+        if let Ok(addr) = env::var("CODEX_USAGE_LISTEN_ADDR") {
+            self.server.listen_addr = addr;
+        }
+        if let Ok(base_url) = env::var("OPENAI_BASE_URL") {
+            self.server.upstream_base_url = base_url;
+        }
+        if let Ok(db_path) = env::var("CODEX_USAGE_DB_PATH") {
+            self.storage.database_path = PathBuf::from(db_path);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default = "default_listen_addr")]
+    pub listen_addr: String,
+    #[serde(default = "default_public_base_path")]
+    pub public_base_path: String,
+    #[serde(default = "default_upstream_base_url")]
+    pub upstream_base_url: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: default_listen_addr(),
+            public_base_path: default_public_base_path(),
+            upstream_base_url: default_upstream_base_url(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageConfig {
+    #[serde(default = "default_database_path")]
+    pub database_path: PathBuf,
+    #[serde(default = "default_flush_interval")]
+    pub flush_interval_secs: u64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            database_path: default_database_path(),
+            flush_interval_secs: default_flush_interval(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DisplayConfig {
+    #[serde(default = "default_recent_capacity")]
+    pub recent_events_capacity: usize,
+    #[serde(default = "default_refresh_hz")]
+    pub refresh_hz: u64,
+}
+
+impl Default for DisplayConfig {
+    fn default() -> Self {
+        Self {
+            recent_events_capacity: default_recent_capacity(),
+            refresh_hz: default_refresh_hz(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PricingConfig {
+    #[serde(default = "default_currency")]
+    pub currency: String,
+    #[serde(default = "default_prompt_rate")]
+    pub default_prompt_per_1k: f64,
+    #[serde(default = "default_completion_rate")]
+    pub default_completion_per_1k: f64,
+    #[serde(default = "default_model_pricing")]
+    pub models: HashMap<String, ModelPricing>,
+}
+
+impl Default for PricingConfig {
+    fn default() -> Self {
+        Self {
+            currency: default_currency(),
+            default_prompt_per_1k: default_prompt_rate(),
+            default_completion_per_1k: default_completion_rate(),
+            models: default_model_pricing(),
+        }
+    }
+}
+
+impl PricingConfig {
+    pub fn price_for_model(&self, model: &str) -> ModelPricing {
+        self.models
+            .get(model)
+            .cloned()
+            .unwrap_or_else(|| ModelPricing {
+                prompt_per_1k: self.default_prompt_per_1k,
+                cached_prompt_per_1k: None,
+                completion_per_1k: self.default_completion_per_1k,
+            })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelPricing {
+    pub prompt_per_1k: f64,
+    #[serde(default)]
+    pub cached_prompt_per_1k: Option<f64>,
+    pub completion_per_1k: f64,
+}
+
+fn default_listen_addr() -> String {
+    "127.0.0.1:8787".to_string()
+}
+
+fn default_public_base_path() -> String {
+    "/v1".to_string()
+}
+
+fn default_upstream_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+
+fn default_database_path() -> PathBuf {
+    PathBuf::from("usage.db")
+}
+
+fn default_flush_interval() -> u64 {
+    5
+}
+
+fn default_recent_capacity() -> usize {
+    500
+}
+
+fn default_refresh_hz() -> u64 {
+    10
+}
+
+fn default_currency() -> String {
+    "USD".to_string()
+}
+
+fn default_prompt_rate() -> f64 {
+    0.010
+}
+
+fn default_completion_rate() -> f64 {
+    0.030
+}
+
+fn default_model_pricing() -> HashMap<String, ModelPricing> {
+    let mut models = HashMap::new();
+
+    models.insert(
+        "gpt-4.1".to_string(),
+        ModelPricing {
+            prompt_per_1k: 0.0020,
+            cached_prompt_per_1k: Some(0.0005),
+            completion_per_1k: 0.0080,
+        },
+    );
+    models.insert(
+        "gpt-4.1-mini".to_string(),
+        ModelPricing {
+            prompt_per_1k: 0.00040,
+            cached_prompt_per_1k: Some(0.00010),
+            completion_per_1k: 0.00160,
+        },
+    );
+    models.insert(
+        "gpt-4.1-nano".to_string(),
+        ModelPricing {
+            prompt_per_1k: 0.00010,
+            cached_prompt_per_1k: Some(0.000025),
+            completion_per_1k: 0.00040,
+        },
+    );
+    models.insert(
+        "gpt-4o-2024-08-06".to_string(),
+        ModelPricing {
+            prompt_per_1k: 0.00250,
+            cached_prompt_per_1k: Some(0.00125),
+            completion_per_1k: 0.0100,
+        },
+    );
+    models.insert(
+        "gpt-4o-mini-2024-07-18".to_string(),
+        ModelPricing {
+            prompt_per_1k: 0.00015,
+            cached_prompt_per_1k: Some(0.000075),
+            completion_per_1k: 0.00060,
+        },
+    );
+    models.insert(
+        "o4-mini".to_string(),
+        ModelPricing {
+            prompt_per_1k: 0.0040,
+            cached_prompt_per_1k: Some(0.0010),
+            completion_per_1k: 0.0160,
+        },
+    );
+
+    models
+}
