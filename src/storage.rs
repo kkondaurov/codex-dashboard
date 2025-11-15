@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use sqlx::{
-    SqlitePool,
+    Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 use std::{
@@ -92,8 +92,134 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn totals_between(
+        &self,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<AggregateTotals> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+                COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+                COALESCE(SUM(total_tokens), 0) as total_tokens,
+                COALESCE(SUM(cost_usd), 0.0) as cost_usd
+            FROM daily_stats
+            WHERE date BETWEEN ? AND ?
+            "#,
+        )
+        .bind(start.to_string())
+        .bind(end.to_string())
+        .fetch_one(&*self.pool)
+        .await
+        .with_context(|| "failed to load totals between dates")?;
+
+        Ok(AggregateTotals {
+            prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+            completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
+            total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+            cost_usd: row.try_get::<f64, _>("cost_usd").unwrap_or(0.0),
+        })
+    }
+
+    pub async fn recent_daily_stats(&self, limit: i64) -> Result<Vec<DailyStatRow>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT date, 
+                   SUM(prompt_tokens) AS prompt_tokens,
+                   SUM(completion_tokens) AS completion_tokens,
+                   SUM(total_tokens) AS total_tokens,
+                   SUM(cost_usd) AS cost_usd
+            FROM daily_stats
+            GROUP BY date
+            ORDER BY date DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&*self.pool)
+        .await
+        .with_context(|| "failed to load recent daily stats")?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let date_str: String = row.try_get("date")?;
+            let date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
+                .with_context(|| format!("invalid date stored in DB: {}", date_str))?;
+            results.push(DailyStatRow {
+                date,
+                prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+                completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
+                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+                cost_usd: row.try_get::<f64, _>("cost_usd").unwrap_or(0.0),
+            });
+        }
+
+        Ok(results)
+    }
+
     #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AggregateTotals {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct DailyStatRow {
+    pub date: NaiveDate,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn aggregates_and_recent_stats_work() {
+        let db_file = NamedTempFile::new().unwrap();
+        let storage = Storage::connect(db_file.path()).await.unwrap();
+        storage.ensure_schema().await.unwrap();
+
+        let day1 = NaiveDate::from_ymd_opt(2025, 11, 14).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2025, 11, 15).unwrap();
+
+        storage
+            .record_daily_stat(day1, "gpt-4.1", 100, 200, 300, 0.5)
+            .await
+            .unwrap();
+        storage
+            .record_daily_stat(day1, "gpt-4o", 50, 50, 100, 0.2)
+            .await
+            .unwrap();
+        storage
+            .record_daily_stat(day2, "gpt-4.1", 20, 30, 50, 0.05)
+            .await
+            .unwrap();
+
+        let totals = storage.totals_between(day1, day2).await.unwrap();
+        assert_eq!(totals.prompt_tokens, 170);
+        assert_eq!(totals.completion_tokens, 280);
+        assert_eq!(totals.total_tokens, 450);
+        assert!((totals.cost_usd - 0.75).abs() < f64::EPSILON);
+
+        let recent = storage.recent_daily_stats(2).await.unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].date, day2);
+        assert_eq!(recent[0].total_tokens, 50);
+        assert_eq!(recent[1].date, day1);
+        assert_eq!(recent[1].total_tokens, 400);
     }
 }
