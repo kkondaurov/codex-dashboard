@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+
+# Local tooling and databases
+/.beads/
+/usage.db
+
+# Misc editor / OS files
+.DS_Store
+.env
+
