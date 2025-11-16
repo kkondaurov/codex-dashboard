@@ -21,9 +21,16 @@ impl App {
         let (aggregator_handle, usage_tx) =
             usage::spawn_aggregator(storage.clone(), self.config.display.recent_events_capacity);
 
+        let recent_events = aggregator_handle.recent_events();
+        let initial_events = storage
+            .recent_events(self.config.display.recent_events_capacity)
+            .await?;
+        for event in initial_events.into_iter().rev() {
+            recent_events.push(event);
+        }
+
         let proxy_handle = proxy::spawn(self.config.clone(), usage_tx.clone()).await?;
 
-        let recent_events = aggregator_handle.recent_events();
         tracing::info!("Launching interactive TUI (requires an attached terminal)");
         tui::run(self.config.clone(), storage.clone(), recent_events).await?;
 

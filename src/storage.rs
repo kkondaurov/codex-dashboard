@@ -1,4 +1,4 @@
-use crate::tokens::blended_total;
+use crate::{tokens::blended_total, usage::UsageEvent};
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use sqlx::{
@@ -653,6 +653,48 @@ impl Storage {
 
         Ok(totals)
     }
+
+    pub async fn recent_events(&self, limit: usize) -> Result<Vec<UsageEvent>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT timestamp, model, title, summary, conversation_id,
+                   prompt_tokens, cached_prompt_tokens, completion_tokens,
+                   total_tokens, reasoning_tokens, cost_usd, usage_included
+            FROM event_log
+            ORDER BY timestamp DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&*self.pool)
+        .await
+        .with_context(|| "failed to load recent events")?;
+
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let timestamp_str: String = row.try_get("timestamp")?;
+            let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .with_context(|| "invalid timestamp in event_log")?;
+            events.push(UsageEvent {
+                timestamp,
+                model: row.try_get::<String, _>("model")?,
+                title: row.try_get::<Option<String>, _>("title")?,
+                summary: row.try_get::<Option<String>, _>("summary")?,
+                conversation_id: row.try_get::<Option<String>, _>("conversation_id")?,
+                prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+                cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0)
+                    as u64,
+                completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
+                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+                reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
+                cost_usd: row.try_get::<f64, _>("cost_usd").unwrap_or(0.0),
+                usage_included: row.try_get::<i64, _>("usage_included").unwrap_or(1) != 0,
+            });
+        }
+
+        Ok(events)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1070,5 +1112,37 @@ mod tests {
         assert_eq!(hourly[0].hour, 9);
         assert_eq!(hourly[0].totals.prompt_tokens, 150);
         assert_eq!(hourly[0].totals.completion_tokens, 40);
+    }
+
+    #[tokio::test]
+    async fn recent_events_returns_latest_entries() {
+        let db_file = NamedTempFile::new().unwrap();
+        let storage = Storage::connect(db_file.path()).await.unwrap();
+        storage.ensure_schema().await.unwrap();
+
+        for idx in 0..3 {
+            storage
+                .record_event(
+                    Utc::now() - ChronoDuration::minutes(idx * 5),
+                    "model",
+                    Some(&format!("title-{idx}")),
+                    Some(&format!("summary-{idx}")),
+                    Some("conv"),
+                    10,
+                    2,
+                    5,
+                    15,
+                    1,
+                    0.1,
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+
+        let events = storage.recent_events(2).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].title.as_deref(), Some("title-0"));
+        assert_eq!(events[1].title.as_deref(), Some("title-1"));
     }
 }
