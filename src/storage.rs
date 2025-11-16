@@ -1,3 +1,4 @@
+use crate::tokens::blended_total;
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{
@@ -614,6 +615,16 @@ pub struct AggregateTotals {
     pub cost_usd: f64,
 }
 
+impl AggregateTotals {
+    pub fn blended_total(&self) -> u64 {
+        blended_total(
+            self.prompt_tokens,
+            self.cached_prompt_tokens,
+            self.completion_tokens,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ConversationAggregate {
     pub conversation_id: Option<String>,
@@ -625,6 +636,16 @@ pub struct ConversationAggregate {
     pub cost_usd: f64,
     pub first_title: Option<String>,
     pub last_summary: Option<String>,
+}
+
+impl ConversationAggregate {
+    pub fn blended_total(&self) -> u64 {
+        blended_total(
+            self.prompt_tokens,
+            self.cached_prompt_tokens,
+            self.completion_tokens,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -639,6 +660,16 @@ pub struct ConversationTurn {
     pub reasoning_tokens: u64,
     pub cost_usd: f64,
     pub usage_included: bool,
+}
+
+impl ConversationTurn {
+    pub fn blended_total(&self) -> u64 {
+        blended_total(
+            self.prompt_tokens,
+            self.cached_prompt_tokens,
+            self.completion_tokens,
+        )
+    }
 }
 
 #[allow(dead_code)]

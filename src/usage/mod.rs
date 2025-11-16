@@ -1,4 +1,4 @@
-use crate::storage::Storage;
+use crate::{storage::Storage, tokens::blended_total};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::{
@@ -21,6 +21,16 @@ pub struct UsageEvent {
     pub reasoning_tokens: u64,
     pub cost_usd: f64,
     pub usage_included: bool,
+}
+
+impl UsageEvent {
+    pub fn blended_total(&self) -> u64 {
+        blended_total(
+            self.prompt_tokens,
+            self.cached_prompt_tokens,
+            self.completion_tokens,
+        )
+    }
 }
 
 pub type UsageEventSender = mpsc::Sender<UsageEvent>;

@@ -260,6 +260,8 @@ fn render_summary(frame: &mut Frame, area: Rect, stats: &SummaryStats) {
         Constraint::Length(12),
         Constraint::Length(12),
         Constraint::Length(12),
+        Constraint::Length(14),
+        Constraint::Length(14),
         Constraint::Length(16),
     ];
     let table = Table::new(rows, widths)
@@ -270,7 +272,8 @@ fn render_summary(frame: &mut Frame, area: Rect, stats: &SummaryStats) {
                 "Cached",
                 "Output",
                 "Reasoning",
-                "Total",
+                "Blended",
+                "API Total",
                 "Cost (USD)",
             ])
             .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
@@ -291,6 +294,7 @@ fn build_summary_row<'a>(label: &'a str, totals: &AggregateTotals, style: Style)
         Cell::from(format_tokens(totals.cached_prompt_tokens)),
         Cell::from(format_tokens(totals.completion_tokens)),
         Cell::from(format_tokens(totals.reasoning_tokens)),
+        Cell::from(format_tokens(totals.blended_total())),
         Cell::from(format_tokens(totals.total_tokens)),
         Cell::from(format_cost(totals.cost_usd)),
     ])
@@ -305,6 +309,8 @@ fn render_recent_events(frame: &mut Frame, area: Rect, config: &AppConfig, recen
         "Input",
         "Cached",
         "Output",
+        "Blended",
+        "API",
         "Reasoning",
         "Cost",
     ])
@@ -325,6 +331,8 @@ fn render_recent_events(frame: &mut Frame, area: Rect, config: &AppConfig, recen
             "–",
             "–",
             "–",
+            "–",
+            "–",
         ])]
     } else {
         recent
@@ -339,6 +347,8 @@ fn render_recent_events(frame: &mut Frame, area: Rect, config: &AppConfig, recen
                     format_usage_tokens(event, event.prompt_tokens),
                     format_usage_tokens(event, event.cached_prompt_tokens),
                     format_usage_tokens(event, event.completion_tokens),
+                    format_usage_tokens(event, event.blended_total()),
+                    format_usage_tokens(event, event.total_tokens),
                     format_usage_tokens(event, event.reasoning_tokens),
                     format_usage_cost(event),
                 ]);
@@ -358,14 +368,16 @@ fn render_recent_events(frame: &mut Frame, area: Rect, config: &AppConfig, recen
 
     let widths = [
         Constraint::Length(10),
+        Constraint::Length(22),
         Constraint::Length(24),
-        Constraint::Length(28),
         Constraint::Length(16),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(12),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Length(11),
     ];
 
     let table = Table::new(rows, widths)
@@ -414,12 +426,14 @@ fn render_turn_table(
         .unwrap_or_else(|| "Conversation Turns".to_string());
     let block = Block::default().title(title).borders(Borders::ALL);
     let header = Row::new(vec![
-        "#", "Time", "Model", "Input", "Cached", "Output", "Total", "Reason", "Cost",
+        "#", "Time", "Model", "Input", "Cached", "Output", "Blended", "API", "Reason", "Cost",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = if turns.is_empty() {
-        vec![Row::new(vec!["–", "No turns", "", "", "", "", "", "", ""])]
+        vec![Row::new(vec![
+            "–", "No turns", "", "", "", "", "", "", "", "",
+        ])]
     } else {
         turns
             .iter()
@@ -431,6 +445,7 @@ fn render_turn_table(
                     format_turn_tokens(turn.usage_included, turn.prompt_tokens),
                     format_turn_tokens(turn.usage_included, turn.cached_prompt_tokens),
                     format_turn_tokens(turn.usage_included, turn.completion_tokens),
+                    format_turn_tokens(turn.usage_included, turn.blended_total()),
                     format_turn_tokens(turn.usage_included, turn.total_tokens),
                     format_turn_tokens(turn.usage_included, turn.reasoning_tokens),
                     format_turn_cost(turn.usage_included, turn.cost_usd),
@@ -443,6 +458,7 @@ fn render_turn_table(
         Constraint::Length(3),
         Constraint::Length(9),
         Constraint::Length(18),
+        Constraint::Length(10),
         Constraint::Length(10),
         Constraint::Length(10),
         Constraint::Length(10),
@@ -475,8 +491,9 @@ fn render_conversation_table(
         "Input",
         "Cached",
         "Output",
+        "Blended",
+        "API",
         "Reasoning",
-        "Total",
         "Cost",
     ])
     .style(
@@ -494,6 +511,7 @@ fn render_conversation_table(
             "–",
             "–",
             "–",
+            "–",
         ])]
     } else {
         aggregates
@@ -505,8 +523,9 @@ fn render_conversation_table(
                     format_tokens(aggregate.prompt_tokens),
                     format_tokens(aggregate.cached_prompt_tokens),
                     format_tokens(aggregate.completion_tokens),
-                    format_tokens(aggregate.reasoning_tokens),
+                    format_tokens(aggregate.blended_total()),
                     format_tokens(aggregate.total_tokens),
+                    format_tokens(aggregate.reasoning_tokens),
                     format_cost(aggregate.cost_usd),
                 ]);
                 if idx == view.selected_row {
@@ -524,6 +543,7 @@ fn render_conversation_table(
 
     let widths = [
         Constraint::Length(18),
+        Constraint::Length(10),
         Constraint::Length(10),
         Constraint::Length(10),
         Constraint::Length(10),
@@ -821,6 +841,8 @@ fn conversation_detail_rows(aggregate: &ConversationAggregate) -> Vec<Row<'stati
             "Conversation",
             full_conversation_label(aggregate.conversation_id.as_ref()),
         ),
+        detail_row("Blended Total", format_tokens(aggregate.blended_total())),
+        detail_row("API Total", format_tokens(aggregate.total_tokens)),
         detail_row(
             "First Prompt",
             format_detail_snippet(aggregate.first_title.as_ref()),

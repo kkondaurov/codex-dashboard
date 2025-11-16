@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod proxy;
 mod storage;
+mod tokens;
 mod tui;
 mod usage;
 
