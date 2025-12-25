@@ -5,7 +5,7 @@ use crate::{
         PriceRow, Storage,
     },
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, Months, NaiveDate, TimeZone, Timelike, Utc,
 };
@@ -26,7 +26,8 @@ use std::{
     collections::HashMap,
     io::{self, Stdout},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::mpsc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Handle;
 
@@ -39,6 +40,12 @@ const STATS_DAILY_COUNT: usize = 14;
 const STATS_WEEKLY_COUNT: usize = 8;
 const STATS_MONTHLY_COUNT: usize = 12;
 const STATS_YEARLY_COUNT: usize = 5;
+const SUMMARY_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+const RECENT_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+const TOP_SPENDING_REFRESH_INTERVAL: Duration = Duration::from_millis(2000);
+const STATS_REFRESH_INTERVAL: Duration = Duration::from_millis(3000);
+const PRICING_REFRESH_INTERVAL: Duration = Duration::from_millis(8000);
+const MODAL_TURNS_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum ViewMode {
@@ -55,6 +62,165 @@ impl ViewMode {
             ViewMode::TopSpending => ViewMode::Stats,
             ViewMode::Stats => ViewMode::Pricing,
             ViewMode::Pricing => ViewMode::Overview,
+        }
+    }
+}
+
+struct UiDataCache {
+    summary: SummaryStats,
+    summary_last: Option<Instant>,
+    recent_conversations: Vec<ConversationAggregate>,
+    recent_last: Option<Instant>,
+    conversation_stats: ConversationStats,
+    stats_breakdown: Option<StatsBreakdown>,
+    stats_last: Option<Instant>,
+    pricing_rows: Vec<PriceRow>,
+    pricing_missing: Vec<MissingPriceRow>,
+    pricing_last: Option<Instant>,
+    modal_turns: Vec<ConversationTurn>,
+    modal_key: Option<String>,
+    modal_last: Option<Instant>,
+}
+
+impl UiDataCache {
+    fn new() -> Self {
+        Self {
+            summary: SummaryStats::default(),
+            summary_last: None,
+            recent_conversations: Vec::new(),
+            recent_last: None,
+            conversation_stats: ConversationStats::empty(),
+            stats_breakdown: None,
+            stats_last: None,
+            pricing_rows: Vec::new(),
+            pricing_missing: Vec::new(),
+            pricing_last: None,
+            modal_turns: Vec::new(),
+            modal_key: None,
+            modal_last: None,
+        }
+    }
+
+    fn should_refresh(last: Option<Instant>, interval: Duration, now: Instant) -> bool {
+        last.map(|at| now.duration_since(at) >= interval).unwrap_or(true)
+    }
+
+    fn invalidate_for_view(&mut self, view: ViewMode) {
+        match view {
+            ViewMode::Overview => {
+                self.summary_last = None;
+                self.recent_last = None;
+            }
+            ViewMode::TopSpending => {
+                self.conversation_stats.invalidate();
+            }
+            ViewMode::Stats => {
+                self.stats_last = None;
+            }
+            ViewMode::Pricing => {
+                self.pricing_last = None;
+            }
+        }
+    }
+
+    fn refresh_overview(
+        &mut self,
+        now: Instant,
+        today: NaiveDate,
+        runtime: &Handle,
+        storage: &Storage,
+    ) {
+        if Self::should_refresh(self.summary_last, SUMMARY_REFRESH_INTERVAL, now) {
+            match runtime.block_on(SummaryStats::gather(storage, today)) {
+                Ok(stats) => self.summary = stats,
+                Err(err) => tracing::warn!(error = %err, "failed to gather summary stats"),
+            }
+            self.summary_last = Some(now);
+        }
+
+        if Self::should_refresh(self.recent_last, RECENT_REFRESH_INTERVAL, now) {
+            match runtime.block_on(storage.recent_conversations()) {
+                Ok(rows) => self.recent_conversations = rows,
+                Err(err) => tracing::warn!(error = %err, "failed to load recent conversations"),
+            }
+            self.recent_last = Some(now);
+        }
+    }
+
+    fn refresh_top_spending(
+        &mut self,
+        today: NaiveDate,
+        now_dt: DateTime<Utc>,
+        now_instant: Instant,
+        runtime: &Handle,
+        storage: &Storage,
+        limit: usize,
+        active_period: usize,
+    ) {
+        self.conversation_stats.ensure_ranges(today, now_dt);
+        self.conversation_stats.poll_ready(now_instant);
+        let _ = self.conversation_stats.start_load_period(
+            active_period,
+            storage,
+            limit,
+            now_instant,
+            runtime,
+        );
+    }
+
+    fn refresh_stats(&mut self, now: Instant, runtime: &Handle, storage: &Storage) {
+        if Self::should_refresh(self.stats_last, STATS_REFRESH_INTERVAL, now) {
+            match runtime.block_on(StatsBreakdown::gather(storage, Utc::now())) {
+                Ok(breakdown) => self.stats_breakdown = Some(breakdown),
+                Err(err) => tracing::warn!(error = %err, "failed to gather extended stats"),
+            }
+            self.stats_last = Some(now);
+        }
+    }
+
+    fn refresh_pricing(&mut self, now: Instant, runtime: &Handle, storage: &Storage) {
+        if Self::should_refresh(self.pricing_last, PRICING_REFRESH_INTERVAL, now) {
+            match runtime.block_on(storage.list_prices()) {
+                Ok(rows) => self.pricing_rows = rows,
+                Err(err) => tracing::warn!(error = %err, "failed to load price list"),
+            }
+            match runtime.block_on(storage.missing_price_models(6)) {
+                Ok(rows) => self.pricing_missing = rows,
+                Err(err) => tracing::warn!(error = %err, "failed to load missing price models"),
+            }
+            self.pricing_last = Some(now);
+        }
+    }
+
+    fn refresh_modal_turns(
+        &mut self,
+        now: Instant,
+        runtime: &Handle,
+        storage: &Storage,
+        selected: Option<&ConversationAggregate>,
+    ) {
+        let Some(selected) = selected else {
+            self.modal_turns.clear();
+            self.modal_key = None;
+            self.modal_last = None;
+            return;
+        };
+
+        let key = conversation_key(selected);
+        if self.modal_key.as_deref() != Some(key.as_str()) {
+            self.modal_key = Some(key);
+            self.modal_last = None;
+        }
+
+        if Self::should_refresh(self.modal_last, MODAL_TURNS_REFRESH_INTERVAL, now) {
+            match runtime.block_on(storage.conversation_turns(
+                selected.conversation_id.as_deref(),
+                TURN_VIEW_LIMIT,
+            )) {
+                Ok(turns) => self.modal_turns = turns,
+                Err(err) => tracing::warn!(error = %err, "failed to load conversation turns"),
+            }
+            self.modal_last = Some(now);
         }
     }
 }
@@ -80,85 +246,134 @@ fn run_blocking(
     let mut pricing_view = PricingViewState::new();
     let mut conversation_modal = ConversationModalState::new();
     let mut view_mode = ViewMode::Overview;
+    let mut previous_view_mode = view_mode;
+    let mut cache = UiDataCache::new();
 
     let loop_result: Result<()> = (|| -> Result<()> {
         loop {
-            let today = Utc::now().date_naive();
-            let recent_conversations = runtime
-                .block_on(storage.recent_conversations())
-                .unwrap_or_else(|err| {
-                    tracing::warn!(error = %err, "failed to load recent conversations");
-                    Vec::new()
-                });
-            let stats = runtime
-                .block_on(SummaryStats::gather(&storage, today))
-                .context("failed to gather summary stats")?;
+            let now_dt = Utc::now();
+            let today = now_dt.date_naive();
+            let pricing_modal_was_open = pricing_view.modal.is_some();
+            let mut should_quit = false;
+
+            if event::poll(tick_rate)? {
+                if let Event::Key(key) = event::read()? {
+                    should_quit = handle_key_event(
+                        key,
+                        &mut view_mode,
+                        &mut overview_view,
+                        &mut top_spending_view,
+                        &mut stats_view,
+                        &mut pricing_view,
+                        &mut conversation_modal,
+                        &cache.recent_conversations,
+                        &cache.conversation_stats,
+                        cache.modal_turns.len(),
+                        &cache.pricing_rows,
+                        &runtime,
+                        &storage,
+                        today,
+                        &config.pricing.currency,
+                    );
+                }
+            }
+
+            while !should_quit && event::poll(Duration::from_millis(0))? {
+                if let Event::Key(key) = event::read()? {
+                    should_quit = handle_key_event(
+                        key,
+                        &mut view_mode,
+                        &mut overview_view,
+                        &mut top_spending_view,
+                        &mut stats_view,
+                        &mut pricing_view,
+                        &mut conversation_modal,
+                        &cache.recent_conversations,
+                        &cache.conversation_stats,
+                        cache.modal_turns.len(),
+                        &cache.pricing_rows,
+                        &runtime,
+                        &storage,
+                        today,
+                        &config.pricing.currency,
+                    );
+                }
+            }
+
+            if should_quit {
+                break Ok(());
+            }
+
+            if pricing_modal_was_open && pricing_view.modal.is_none() {
+                cache.pricing_last = None;
+            }
+
+            if view_mode != previous_view_mode {
+                cache.invalidate_for_view(view_mode);
+                previous_view_mode = view_mode;
+            }
+
+            let now = Instant::now();
             let conversation_limit = config.display.recent_events_capacity.max(50);
-            let conversation_stats = runtime
-                .block_on(ConversationStats::gather(
-                    &storage,
-                    today,
-                    conversation_limit,
-                ))
-                .context("failed to gather conversation aggregates")?;
-            overview_view.sync_with(recent_conversations.len());
-            top_spending_view.sync_with(&conversation_stats);
+
+            match view_mode {
+                ViewMode::Overview => {
+                    cache.refresh_overview(now, today, &runtime, &storage);
+                    overview_view.sync_with(cache.recent_conversations.len());
+                }
+                ViewMode::TopSpending => {
+                    cache.refresh_top_spending(
+                        today,
+                        now_dt,
+                        now,
+                        &runtime,
+                        &storage,
+                        conversation_limit,
+                        top_spending_view.active_period,
+                    );
+                    top_spending_view.sync_with(&cache.conversation_stats);
+                }
+                ViewMode::Stats => {
+                    cache.refresh_stats(now, &runtime, &storage);
+                    if let Some(breakdown) = cache.stats_breakdown.as_ref() {
+                        stats_view.sync(breakdown);
+                    }
+                }
+                ViewMode::Pricing => {
+                    if pricing_view.modal.is_none() {
+                        cache.refresh_pricing(now, &runtime, &storage);
+                    }
+                    pricing_view.sync(cache.pricing_rows.len());
+                }
+            }
 
             let selected_conversation = match view_mode {
-                ViewMode::Overview => overview_view.selected(&recent_conversations),
-                ViewMode::TopSpending => top_spending_view.selected(&conversation_stats),
+                ViewMode::Overview => overview_view.selected(&cache.recent_conversations),
+                ViewMode::TopSpending => top_spending_view.selected(&cache.conversation_stats),
                 _ => None,
-            };
+            }
+            .cloned();
 
             if conversation_modal.is_open() && selected_conversation.is_none() {
                 conversation_modal.close();
             }
 
-            let conversation_turns = if conversation_modal.is_open() {
-                selected_conversation
-                    .and_then(|selected| {
-                        runtime
-                            .block_on(storage.conversation_turns(
-                                selected.conversation_id.as_deref(),
-                                TURN_VIEW_LIMIT,
-                            ))
-                            .map_err(|err| {
-                                tracing::warn!(
-                                    error = %err,
-                                    "failed to load conversation turns"
-                                );
-                                err
-                            })
-                            .ok()
-                    })
-                    .unwrap_or_default()
+            if conversation_modal.is_open() {
+                cache.refresh_modal_turns(now, &runtime, &storage, selected_conversation.as_ref());
             } else {
-                Vec::new()
-            };
+                cache.refresh_modal_turns(now, &runtime, &storage, None);
+            }
+
             let stats_breakdown = if matches!(view_mode, ViewMode::Stats) {
-                let breakdown = runtime
-                    .block_on(StatsBreakdown::gather(&storage, Utc::now()))
-                    .context("failed to gather extended stats")?;
-                stats_view.sync(&breakdown);
-                Some(breakdown)
+                cache.stats_breakdown.as_ref()
             } else {
                 None
             };
             let (pricing_rows, pricing_missing) = if matches!(view_mode, ViewMode::Pricing) {
-                let rows = runtime
-                    .block_on(storage.list_prices())
-                    .unwrap_or_else(|err| {
-                        tracing::warn!(error = %err, "failed to load price list");
-                        Vec::new()
-                    });
-                let missing = runtime
-                    .block_on(storage.missing_price_models(6))
-                    .unwrap_or_else(|err| {
-                        tracing::warn!(error = %err, "failed to load missing price models");
-                        Vec::new()
-                    });
-                pricing_view.sync(rows.len());
-                (Some(rows), Some(missing))
+                (
+                    Some(cache.pricing_rows.as_slice()),
+                    Some(cache.pricing_missing.as_slice()),
+                )
             } else {
                 (None, None)
             };
@@ -168,154 +383,23 @@ fn run_blocking(
                 draw_ui(
                     frame,
                     &config,
-                    &stats,
-                    &recent_conversations,
+                    &cache.summary,
+                    &cache.recent_conversations,
                     &mut overview_view,
-                    &conversation_stats,
+                    &cache.conversation_stats,
                     &mut top_spending_view,
                     &stats_view,
                     &pricing_view,
-                    selected_conversation,
-                    &conversation_turns,
+                    selected_conversation.as_ref(),
+                    &cache.modal_turns,
                     &mut conversation_modal,
-                    stats_breakdown.as_ref(),
-                    pricing_rows.as_deref(),
-                    pricing_missing.as_deref(),
+                    stats_breakdown,
+                    pricing_rows,
+                    pricing_missing,
                     show_cursor,
                     view_mode,
                 );
             })?;
-
-            if event::poll(tick_rate)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.code == KeyCode::Char('q')
-                        || (key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL))
-                    {
-                        break Ok(());
-                    }
-
-                    if conversation_modal.is_open()
-                        && handle_conversation_modal_input(
-                            &mut conversation_modal,
-                            key,
-                            conversation_turns.len(),
-                        )
-                    {
-                        continue;
-                    }
-
-                    if handle_pricing_input(
-                        view_mode,
-                        &mut pricing_view,
-                        pricing_rows.as_deref().unwrap_or(&[]),
-                        key,
-                        &runtime,
-                        &storage,
-                        today,
-                        &config.pricing.currency,
-                    ) {
-                        continue;
-                    }
-
-                    match key.code {
-                        KeyCode::Char('1') => {
-                            view_mode = ViewMode::Overview;
-                        }
-                        KeyCode::Char('2') => {
-                            view_mode = ViewMode::TopSpending;
-                        }
-                        KeyCode::Char('3') => {
-                            view_mode = ViewMode::Stats;
-                        }
-                        KeyCode::Char('4') => {
-                            view_mode = ViewMode::Pricing;
-                        }
-                        KeyCode::Tab => {
-                            view_mode = view_mode.next();
-                        }
-                        KeyCode::Esc => {
-                            view_mode = ViewMode::Overview;
-                        }
-                        KeyCode::Left | KeyCode::Char('h') => match view_mode {
-                            ViewMode::TopSpending => {
-                                top_spending_view.prev_period(conversation_stats.periods_len())
-                            }
-                            ViewMode::Stats => stats_view.prev_period(),
-                            _ => {}
-                        },
-                        KeyCode::Right | KeyCode::Char('l') => match view_mode {
-                            ViewMode::TopSpending => {
-                                top_spending_view.next_period(conversation_stats.periods_len())
-                            }
-                            ViewMode::Stats => stats_view.next_period(),
-                            _ => {}
-                        },
-                        KeyCode::Up | KeyCode::Char('k') => match view_mode {
-                            ViewMode::Overview => {
-                                overview_view.move_selection_up(recent_conversations.len());
-                            }
-                            ViewMode::TopSpending => {
-                                let rows = conversation_stats
-                                    .active_period_len(top_spending_view.active_period);
-                                top_spending_view.move_selection_up(rows);
-                            }
-                            _ => {}
-                        },
-                        KeyCode::Down | KeyCode::Char('j') => match view_mode {
-                            ViewMode::Overview => {
-                                overview_view.move_selection_down(recent_conversations.len());
-                            }
-                            ViewMode::TopSpending => {
-                                let rows = conversation_stats
-                                    .active_period_len(top_spending_view.active_period);
-                                top_spending_view.move_selection_down(rows);
-                            }
-                            _ => {}
-                        },
-                        KeyCode::PageUp => match view_mode {
-                            ViewMode::Overview => {
-                                overview_view.page_up(recent_conversations.len());
-                            }
-                            ViewMode::TopSpending => {
-                                let rows = conversation_stats
-                                    .active_period_len(top_spending_view.active_period);
-                                top_spending_view.page_up(rows);
-                            }
-                            _ => {}
-                        },
-                        KeyCode::PageDown => match view_mode {
-                            ViewMode::Overview => {
-                                overview_view.page_down(recent_conversations.len());
-                            }
-                            ViewMode::TopSpending => {
-                                let rows = conversation_stats
-                                    .active_period_len(top_spending_view.active_period);
-                                top_spending_view.page_down(rows);
-                            }
-                            _ => {}
-                        },
-                        KeyCode::Enter => match view_mode {
-                            ViewMode::Overview => {
-                                if let Some(selected) =
-                                    overview_view.selected(&recent_conversations)
-                                {
-                                    conversation_modal.open_for(conversation_key(selected));
-                                }
-                            }
-                            ViewMode::TopSpending => {
-                                if let Some(selected) =
-                                    top_spending_view.selected(&conversation_stats)
-                                {
-                                    conversation_modal.open_for(conversation_key(selected));
-                                }
-                            }
-                            _ => {}
-                        },
-                        _ => {}
-                    }
-                }
-            }
         }
     })();
 
@@ -851,6 +935,61 @@ fn should_show_cursor() -> bool {
     (now / 500) % 2 == 0
 }
 
+fn loading_symbol() -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let idx = (now / 90) as usize % FRAMES.len();
+    FRAMES[idx]
+}
+
+fn loading_gradient_line(text: &str, theme: &UiTheme) -> Line<'static> {
+    let palette: &[Color] = if theme.text_fg == Color::DarkGray {
+        &[
+            Color::DarkGray,
+            Color::DarkGray,
+            Color::Gray,
+            Color::Gray,
+            Color::DarkGray,
+        ]
+    } else {
+        &[
+            Color::DarkGray,
+            Color::Gray,
+            Color::White,
+            Color::Gray,
+            Color::DarkGray,
+        ]
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let len = text.chars().count().max(1);
+    let travel = len + palette.len();
+    let phase = (now / 120) as usize % (travel * 2);
+    let offset = if phase < travel {
+        phase
+    } else {
+        (travel * 2).saturating_sub(phase)
+    };
+
+    let mut spans = Vec::with_capacity(len + 1);
+    spans.push(Span::raw(" "));
+    for (idx, ch) in text.chars().enumerate() {
+        let color = palette[(idx + offset) % palette.len()];
+        spans.push(Span::styled(
+            ch.to_string(),
+            Style::default()
+                .fg(color)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
 fn render_navbar(frame: &mut Frame, area: Rect, view_mode: ViewMode, dim: bool) {
     let theme = ui_theme(dim);
     let tabs = [
@@ -956,7 +1095,15 @@ fn render_recent_conversations(
     let title = format!(
         "Recent Conversations – {total} total • page {page}/{pages} (↑/↓ PgUp/PgDn navigate, Enter details)"
     );
-    render_conversation_list_table(frame, area, conversations, &mut view.list, title, &theme);
+    render_conversation_list_table(
+        frame,
+        area,
+        conversations,
+        &mut view.list,
+        title,
+        &theme,
+        None,
+    );
 }
 
 fn render_top_spending_table(
@@ -967,21 +1114,42 @@ fn render_top_spending_table(
     dim: bool,
 ) {
     let theme = ui_theme(dim);
-    let (label, aggregates): (&str, &[ConversationAggregate]) =
+    let (label, aggregates, loading): (&str, &[ConversationAggregate], bool) =
         if let Some(period) = stats.period(view.active_period) {
-            (period.label, &period.aggregates)
+            (
+                period.label,
+                period.aggregates.as_deref().unwrap_or(&[]),
+                period.loading,
+            )
         } else {
-            ("No Data", &[])
+            ("No Data", &[], false)
         };
 
     let total = aggregates.len();
     let visible_rows = visible_rows_for_table(area);
     view.list.set_visible_rows(visible_rows, total);
     let (page, pages) = view.list.page_info(total);
-    let title = format!(
-        "Top Spending – {label} • {total} conversations • page {page}/{pages} (←/→ period, ↑/↓ PgUp/PgDn, Enter details)"
+    let title = if loading {
+        format!("Top Spending – {label} • loading {} (←/→ period)", loading_symbol())
+    } else {
+        format!(
+            "Top Spending – {label} • {total} conversations • page {page}/{pages} (←/→ period, ↑/↓ PgUp/PgDn, Enter details)"
+        )
+    };
+    let empty_state = if loading {
+        Some(EmptyState::Loading)
+    } else {
+        None
+    };
+    render_conversation_list_table(
+        frame,
+        area,
+        aggregates,
+        &mut view.list,
+        title,
+        &theme,
+        empty_state,
     );
-    render_conversation_list_table(frame, area, aggregates, &mut view.list, title, &theme);
 }
 
 fn render_conversation_list_table(
@@ -991,6 +1159,7 @@ fn render_conversation_list_table(
     list: &mut ListState,
     title: String,
     theme: &UiTheme,
+    empty_state: Option<EmptyState>,
 ) {
     let visible_rows = list.visible_rows;
 
@@ -1012,19 +1181,22 @@ fn render_conversation_list_table(
     );
 
     let rows: Vec<Row> = if conversations.is_empty() {
-        vec![Row::new(vec![
-            "–",
-            " No conversations",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-        ])]
+        let (label_cell, rest_cells): (Cell, Vec<Cell>) = match empty_state {
+            Some(EmptyState::Loading) => (
+                Cell::from(loading_gradient_line("Loading...", theme)),
+                vec![Cell::from(""); 9],
+            ),
+            None => (
+                Cell::from(" No conversations"),
+                vec![Cell::from(""); 9],
+            ),
+        };
+
+        let mut cells = Vec::with_capacity(11);
+        cells.push(Cell::from("–"));
+        cells.push(label_cell);
+        cells.extend(rest_cells);
+        vec![Row::new(cells)]
     } else {
         let start = list.scroll_offset;
         let end = (start + visible_rows).min(conversations.len());
@@ -1077,6 +1249,10 @@ fn render_conversation_list_table(
         .style(Style::default().fg(theme.text_fg));
 
     frame.render_widget(table, area);
+}
+
+enum EmptyState {
+    Loading,
 }
 
 fn render_conversation_metadata(
@@ -1268,6 +1444,140 @@ fn format_turn_cost(included: bool, cost: Option<f64>) -> String {
     }
 }
 
+fn handle_key_event(
+    key: KeyEvent,
+    view_mode: &mut ViewMode,
+    overview_view: &mut RecentConversationViewState,
+    top_spending_view: &mut TopSpendingViewState,
+    stats_view: &mut StatsViewState,
+    pricing_view: &mut PricingViewState,
+    conversation_modal: &mut ConversationModalState,
+    recent_conversations: &[ConversationAggregate],
+    conversation_stats: &ConversationStats,
+    conversation_turns_len: usize,
+    pricing_rows: &[PriceRow],
+    runtime: &Handle,
+    storage: &Storage,
+    today: NaiveDate,
+    default_currency: &str,
+) -> bool {
+    if key.code == KeyCode::Char('q')
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        return true;
+    }
+
+    if conversation_modal.is_open()
+        && handle_conversation_modal_input(conversation_modal, key, conversation_turns_len)
+    {
+        return false;
+    }
+
+    if handle_pricing_input(
+        *view_mode,
+        pricing_view,
+        pricing_rows,
+        key,
+        runtime,
+        storage,
+        today,
+        default_currency,
+    ) {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Char('1') => {
+            *view_mode = ViewMode::Overview;
+        }
+        KeyCode::Char('2') => {
+            *view_mode = ViewMode::TopSpending;
+        }
+        KeyCode::Char('3') => {
+            *view_mode = ViewMode::Stats;
+        }
+        KeyCode::Char('4') => {
+            *view_mode = ViewMode::Pricing;
+        }
+        KeyCode::Tab => {
+            *view_mode = view_mode.next();
+        }
+        KeyCode::Esc => {
+            *view_mode = ViewMode::Overview;
+        }
+        KeyCode::Left | KeyCode::Char('h') => match *view_mode {
+            ViewMode::TopSpending => {
+                top_spending_view.prev_period(conversation_stats.periods_len())
+            }
+            ViewMode::Stats => stats_view.prev_period(),
+            _ => {}
+        },
+        KeyCode::Right | KeyCode::Char('l') => match *view_mode {
+            ViewMode::TopSpending => {
+                top_spending_view.next_period(conversation_stats.periods_len())
+            }
+            ViewMode::Stats => stats_view.next_period(),
+            _ => {}
+        },
+        KeyCode::Up | KeyCode::Char('k') => match *view_mode {
+            ViewMode::Overview => {
+                overview_view.move_selection_up(recent_conversations.len());
+            }
+            ViewMode::TopSpending => {
+                let rows = conversation_stats.active_period_len(top_spending_view.active_period);
+                top_spending_view.move_selection_up(rows);
+            }
+            _ => {}
+        },
+        KeyCode::Down | KeyCode::Char('j') => match *view_mode {
+            ViewMode::Overview => {
+                overview_view.move_selection_down(recent_conversations.len());
+            }
+            ViewMode::TopSpending => {
+                let rows = conversation_stats.active_period_len(top_spending_view.active_period);
+                top_spending_view.move_selection_down(rows);
+            }
+            _ => {}
+        },
+        KeyCode::PageUp => match *view_mode {
+            ViewMode::Overview => {
+                overview_view.page_up(recent_conversations.len());
+            }
+            ViewMode::TopSpending => {
+                let rows = conversation_stats.active_period_len(top_spending_view.active_period);
+                top_spending_view.page_up(rows);
+            }
+            _ => {}
+        },
+        KeyCode::PageDown => match *view_mode {
+            ViewMode::Overview => {
+                overview_view.page_down(recent_conversations.len());
+            }
+            ViewMode::TopSpending => {
+                let rows = conversation_stats.active_period_len(top_spending_view.active_period);
+                top_spending_view.page_down(rows);
+            }
+            _ => {}
+        },
+        KeyCode::Enter => match *view_mode {
+            ViewMode::Overview => {
+                if let Some(selected) = overview_view.selected(recent_conversations) {
+                    conversation_modal.open_for(conversation_key(selected));
+                }
+            }
+            ViewMode::TopSpending => {
+                if let Some(selected) = top_spending_view.selected(conversation_stats) {
+                    conversation_modal.open_for(conversation_key(selected));
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+
+    false
+}
+
 fn handle_conversation_modal_input(
     modal: &mut ConversationModalState,
     key: KeyEvent,
@@ -1454,6 +1764,16 @@ struct SummaryStats {
     today: AggregateTotals,
 }
 
+impl Default for SummaryStats {
+    fn default() -> Self {
+        Self {
+            last_10m: AggregateTotals::default(),
+            last_hour: AggregateTotals::default(),
+            today: AggregateTotals::default(),
+        }
+    }
+}
+
 impl SummaryStats {
     async fn gather(storage: &Storage, today: NaiveDate) -> Result<Self> {
         let now = Utc::now();
@@ -1606,12 +1926,39 @@ struct StatRow {
 }
 
 struct ConversationStats {
+    anchor_date: Option<NaiveDate>,
     periods: Vec<ConversationPeriodStats>,
 }
 
 impl ConversationStats {
-    async fn gather(storage: &Storage, today: NaiveDate, limit: usize) -> Result<Self> {
-        let now = Utc::now();
+    fn empty() -> Self {
+        Self {
+            anchor_date: None,
+            periods: Vec::new(),
+        }
+    }
+
+    fn ensure_ranges(&mut self, today: NaiveDate, now: DateTime<Utc>) {
+        if self.anchor_date != Some(today) || self.periods.is_empty() {
+            *self = Self::new(today, now);
+            return;
+        }
+
+        for period in &mut self.periods {
+            period.end = now;
+        }
+    }
+
+    fn invalidate(&mut self) {
+        for period in &mut self.periods {
+            period.aggregates = None;
+            period.last_loaded = None;
+            period.loading = false;
+            period.pending_rx = None;
+        }
+    }
+
+    fn new(today: NaiveDate, now: DateTime<Utc>) -> Self {
         let week_start = today
             .checked_sub_signed(ChronoDuration::days(6))
             .unwrap_or(today);
@@ -1623,39 +1970,75 @@ impl ConversationStats {
         let month_start_dt = start_of_day(month_start);
         let all_time_start_dt = start_of_day(all_time_start);
 
-        let day = storage
-            .top_conversations_between(day_start, now, limit, true)
-            .await?;
-        let week = storage
-            .top_conversations_between(week_start_dt, now, limit, true)
-            .await?;
-        let month = storage
-            .top_conversations_between(month_start_dt, now, limit, true)
-            .await?;
-        let all_time = storage
-            .top_conversations_between(all_time_start_dt, now, limit, true)
-            .await?;
-
-        Ok(Self {
+        Self {
+            anchor_date: Some(today),
             periods: vec![
-                ConversationPeriodStats {
-                    label: "Today",
-                    aggregates: day,
-                },
-                ConversationPeriodStats {
-                    label: "This Week",
-                    aggregates: week,
-                },
-                ConversationPeriodStats {
-                    label: "This Month",
-                    aggregates: month,
-                },
-                ConversationPeriodStats {
-                    label: "All Time",
-                    aggregates: all_time,
-                },
+                ConversationPeriodStats::new("Today", day_start, now),
+                ConversationPeriodStats::new("This Week", week_start_dt, now),
+                ConversationPeriodStats::new("This Month", month_start_dt, now),
+                ConversationPeriodStats::new("All Time", all_time_start_dt, now),
             ],
-        })
+        }
+    }
+
+    fn start_load_period(
+        &mut self,
+        idx: usize,
+        storage: &Storage,
+        limit: usize,
+        now: Instant,
+        runtime: &Handle,
+    ) -> Result<()> {
+        let Some(period) = self.periods.get_mut(idx) else {
+            return Ok(());
+        };
+
+        if !period.should_refresh(now) {
+            return Ok(());
+        }
+
+        let (tx, rx) = mpsc::channel();
+        period.loading = true;
+        period.pending_rx = Some(rx);
+
+        let start = period.start;
+        let end = period.end;
+        let storage = storage.clone();
+        runtime.spawn(async move {
+            let result = storage
+                .top_conversations_between(start, end, limit, true)
+                .await;
+            let _ = tx.send(result);
+        });
+        Ok(())
+    }
+
+    fn poll_ready(&mut self, now: Instant) {
+        for period in &mut self.periods {
+            let Some(rx) = period.pending_rx.as_mut() else {
+                continue;
+            };
+            match rx.try_recv() {
+                Ok(result) => {
+                    period.pending_rx = None;
+                    period.loading = false;
+                    match result {
+                        Ok(aggregates) => {
+                            period.aggregates = Some(aggregates);
+                            period.last_loaded = Some(now);
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "failed to load top spending period");
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    period.pending_rx = None;
+                    period.loading = false;
+                }
+            }
+        }
     }
 
     fn period(&self, idx: usize) -> Option<&ConversationPeriodStats> {
@@ -1667,7 +2050,9 @@ impl ConversationStats {
     }
 
     fn active_period_len(&self, idx: usize) -> usize {
-        self.period(idx).map(|p| p.aggregates.len()).unwrap_or(0)
+        self.period(idx)
+            .and_then(|p| p.aggregates.as_ref().map(|items| items.len()))
+            .unwrap_or(0)
     }
 
     fn is_empty(&self) -> bool {
@@ -1677,7 +2062,37 @@ impl ConversationStats {
 
 struct ConversationPeriodStats {
     label: &'static str,
-    aggregates: Vec<ConversationAggregate>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    aggregates: Option<Vec<ConversationAggregate>>,
+    last_loaded: Option<Instant>,
+    loading: bool,
+    pending_rx: Option<mpsc::Receiver<Result<Vec<ConversationAggregate>>>>,
+}
+
+impl ConversationPeriodStats {
+    fn new(label: &'static str, start: DateTime<Utc>, end: DateTime<Utc>) -> Self {
+        Self {
+            label,
+            start,
+            end,
+            aggregates: None,
+            last_loaded: None,
+            loading: false,
+            pending_rx: None,
+        }
+    }
+
+    fn should_refresh(&self, now: Instant) -> bool {
+        if self.loading {
+            return false;
+        }
+        self.aggregates.is_none()
+            || self
+                .last_loaded
+                .map(|at| now.duration_since(at) >= TOP_SPENDING_REFRESH_INTERVAL)
+                .unwrap_or(true)
+    }
 }
 
 struct ListState {
@@ -1902,7 +2317,7 @@ impl TopSpendingViewState {
     fn selected<'a>(&self, stats: &'a ConversationStats) -> Option<&'a ConversationAggregate> {
         stats
             .period(self.active_period)
-            .and_then(|period| period.aggregates.get(self.list.selected_row))
+            .and_then(|period| period.aggregates.as_ref()?.get(self.list.selected_row))
     }
 }
 
@@ -2339,4 +2754,111 @@ fn gray_block(title: impl Into<String>, theme: &UiTheme) -> Block<'static> {
         .title(title.into())
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border_fg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    async fn insert_price(
+        storage: &Storage,
+        model: &str,
+        effective_from: NaiveDate,
+        prompt_per_1m: f64,
+        cached_prompt_per_1m: Option<f64>,
+        completion_per_1m: f64,
+    ) {
+        storage
+            .insert_price(&NewPrice {
+                model: model.to_string(),
+                effective_from,
+                currency: "USD".to_string(),
+                prompt_per_1m,
+                cached_prompt_per_1m,
+                completion_per_1m,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn conversation_stats_lazy_loads_single_period() {
+        let db_file = NamedTempFile::new().unwrap();
+        let storage = Storage::connect(db_file.path()).await.unwrap();
+        storage.ensure_schema().await.unwrap();
+
+        let today = Utc::now().date_naive();
+        insert_price(&storage, "gpt-test", today, 1.0, Some(1.0), 1.0).await;
+
+        let now = Utc::now();
+        storage
+            .record_event(
+                now,
+                "gpt-test",
+                Some("title"),
+                Some("summary"),
+                Some("conv-1"),
+                100,
+                0,
+                50,
+                150,
+                0,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let mut stats = ConversationStats::new(today, now);
+        assert!(stats.period(0).unwrap().aggregates.is_none());
+
+        let handle = Handle::current();
+        stats
+            .start_load_period(0, &storage, 10, Instant::now(), &handle)
+            .unwrap();
+
+        let start = Instant::now();
+        loop {
+            stats.poll_ready(Instant::now());
+            if stats.period(0).unwrap().aggregates.is_some() {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!("timed out waiting for lazy-load");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(!stats.period(0).unwrap().aggregates.as_ref().unwrap().is_empty());
+        assert!(stats.period(1).unwrap().aggregates.is_none());
+        assert!(stats.period(2).unwrap().aggregates.is_none());
+        assert!(stats.period(3).unwrap().aggregates.is_none());
+    }
+
+    #[test]
+    fn conversation_stats_invalidate_clears_cached_periods() {
+        let today = NaiveDate::from_ymd_opt(2025, 12, 25).unwrap();
+        let now = Utc::now();
+        let mut stats = ConversationStats::new(today, now);
+        stats.periods[0].aggregates = Some(Vec::new());
+        stats.periods[0].last_loaded = Some(Instant::now());
+
+        stats.invalidate();
+
+        assert!(stats.periods[0].aggregates.is_none());
+        assert!(stats.periods[0].last_loaded.is_none());
+    }
+
+    #[test]
+    fn conversation_stats_resets_on_new_day() {
+        let day1 = NaiveDate::from_ymd_opt(2025, 12, 24).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2025, 12, 25).unwrap();
+        let mut stats = ConversationStats::new(day1, Utc::now());
+        stats.periods[0].aggregates = Some(Vec::new());
+
+        stats.ensure_ranges(day2, Utc::now());
+
+        assert_eq!(stats.anchor_date, Some(day2));
+        assert!(stats.periods[0].aggregates.is_none());
+    }
 }
