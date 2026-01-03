@@ -11,9 +11,9 @@ Under the hood, it tails session files as they are updated and aggregates token 
 ## Screenshots
 <details>
 
-<summary>Overview and last sessions</summary>
+<summary>Overview</summary>
 
-![overview](/screenshots/1-overview-last-convos-v3.png)
+![overview](/screenshots/1-overview-v4.png)
 
 </details>
 
@@ -22,16 +22,7 @@ Under the hood, it tails session files as they are updated and aggregates token 
 
 <summary>Session details</summary>
 
-![overview](/screenshots/2-overview-session-details-v3.png)
-
-</details>
-
-
-<details>
-
-<summary>Top conversations by cost per day, week, month, and all time</summary>
-
-![overview](/screenshots/3-top-spending-v3.png)
+![overview](/screenshots/2-sessions-v4.png)
 
 </details>
 
@@ -39,7 +30,7 @@ Under the hood, it tails session files as they are updated and aggregates token 
 
 <summary>Stats per hour, day, week, month and year</summary>
 
-![overview](/screenshots/4-stats-per-period-v3.png)
+![overview](/screenshots/3-stats-v4.png)
 
 </details>
 
@@ -47,7 +38,7 @@ Under the hood, it tails session files as they are updated and aggregates token 
 
 <summary>Pricing configuration</summary>
 
-![overview](/screenshots/5-pricing-v3.png)
+![overview](/screenshots/4-pricing-v4.png)
 
 </details>
 
@@ -79,3 +70,7 @@ To rebuild usage data from logs (clear non-pricing tables first):
 ```
 cargo run --release -- --rebuild
 ```
+
+## Inspiration
+
+This project’s “overview” view was inspired by [`codex-wrapped`](https://github.com/numman-ali/codex-wrapped).

@@ -2,7 +2,7 @@ use crate::{
     config::{AppConfig, PricingConfig},
     pricing_remote,
     storage::{
-        AggregateTotals, MissingPriceDetail, ModelUsageRow, PriceRow, PricingMeta,
+        AggregateTotals, DailyTokenTotal, MissingPriceDetail, ModelUsageRow, PriceRow, PricingMeta,
         SessionAggregate, SessionMessage, SessionTurn, Storage, ToolCountRow, TopModelShare,
     },
 };
@@ -26,7 +26,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{self, Stdout, Write},
     path::Path,
     sync::Arc,
@@ -45,17 +45,36 @@ const MODAL_COST_COL_WIDTH: u16 = 10;
 const MODAL_TOKEN_COL_WIDTH: u16 = 7;
 const MODAL_REASON_COL_WIDTH: u16 = 9;
 const MODAL_CONTEXT_COL_WIDTH: u16 = 11;
+
+const HEATMAP_COLORS: [Color; 7] = [
+    Color::Rgb(35, 35, 35),
+    Color::Rgb(55, 90, 70),
+    Color::Rgb(70, 120, 85),
+    Color::Rgb(85, 150, 100),
+    Color::Rgb(105, 180, 120),
+    Color::Rgb(130, 205, 145),
+    Color::Rgb(155, 230, 170),
+];
+const STREAK_COLORS: [Color; 7] = [
+    Color::Rgb(35, 35, 35),
+    Color::Rgb(60, 90, 140),
+    Color::Rgb(75, 115, 175),
+    Color::Rgb(95, 140, 210),
+    Color::Rgb(115, 165, 230),
+    Color::Rgb(135, 190, 245),
+    Color::Rgb(155, 215, 255),
+];
 const SUMMARY_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const RECENT_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
-const TOP_SPENDING_REFRESH_INTERVAL: Duration = Duration::from_millis(2000);
 const STATS_REFRESH_INTERVAL: Duration = Duration::from_millis(3000);
 const PRICING_REFRESH_INTERVAL: Duration = Duration::from_millis(8000);
 const MODAL_MESSAGES_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
+const WRAPPED_REFRESH_INTERVAL: Duration = Duration::from_millis(8000);
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum ViewMode {
     Overview,
-    TopSpending,
+    Sessions,
     Stats,
     Pricing,
 }
@@ -63,8 +82,8 @@ enum ViewMode {
 impl ViewMode {
     fn next(self) -> Self {
         match self {
-            ViewMode::Overview => ViewMode::TopSpending,
-            ViewMode::TopSpending => ViewMode::Stats,
+            ViewMode::Overview => ViewMode::Sessions,
+            ViewMode::Sessions => ViewMode::Stats,
             ViewMode::Stats => ViewMode::Pricing,
             ViewMode::Pricing => ViewMode::Overview,
         }
@@ -88,6 +107,22 @@ impl TimeRange {
             'm' => Some(TimeRange::Month),
             'y' => Some(TimeRange::Year),
             'a' => Some(TimeRange::All),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum SessionSort {
+    Recent,
+    Cost,
+}
+
+impl SessionSort {
+    fn from_key(ch: char) -> Option<Self> {
+        match ch.to_ascii_lowercase() {
+            'r' => Some(SessionSort::Recent),
+            'c' => Some(SessionSort::Cost),
             _ => None,
         }
     }
@@ -171,14 +206,12 @@ impl TimeNavState {
 struct UiDataCache {
     hero: HeroStats,
     hero_last: Option<Instant>,
-    recent_sessions: Vec<SessionAggregate>,
-    recent_total: usize,
-    recent_offset: usize,
-    recent_limit: usize,
-    recent_last: Option<Instant>,
-    top_spending_rows: Vec<SessionAggregate>,
-    top_spending_last: Option<Instant>,
-    top_spending_key: Option<(TimeRange, NaiveDate)>,
+    sessions_rows: Vec<SessionAggregate>,
+    sessions_total: usize,
+    sessions_offset: usize,
+    sessions_limit: usize,
+    sessions_last: Option<Instant>,
+    sessions_key: Option<(TimeRange, NaiveDate, SessionSort)>,
     stats_data: Option<StatsRangeData>,
     stats_last: Option<Instant>,
     stats_key: Option<(TimeRange, NaiveDate)>,
@@ -190,6 +223,10 @@ struct UiDataCache {
     last_ingest: Option<DateTime<Utc>>,
     ingest_last: Option<Instant>,
     ingest_flash: Option<Instant>,
+    wrapped_data: Option<WrappedStats>,
+    wrapped_year: Option<i32>,
+    wrapped_last: Option<Instant>,
+    wrapped_ingest_at: Option<DateTime<Utc>>,
     modal_messages: Vec<SessionMessage>,
     modal_message_total: usize,
     modal_unattributed: Option<SessionMessage>,
@@ -209,14 +246,12 @@ impl UiDataCache {
         Self {
             hero: HeroStats::default(),
             hero_last: None,
-            recent_sessions: Vec::new(),
-            recent_total: 0,
-            recent_offset: 0,
-            recent_limit: 0,
-            recent_last: None,
-            top_spending_rows: Vec::new(),
-            top_spending_last: None,
-            top_spending_key: None,
+            sessions_rows: Vec::new(),
+            sessions_total: 0,
+            sessions_offset: 0,
+            sessions_limit: 0,
+            sessions_last: None,
+            sessions_key: None,
             stats_data: None,
             stats_last: None,
             stats_key: None,
@@ -228,6 +263,10 @@ impl UiDataCache {
             last_ingest: None,
             ingest_last: None,
             ingest_flash: None,
+            wrapped_data: None,
+            wrapped_year: None,
+            wrapped_last: None,
+            wrapped_ingest_at: None,
             modal_messages: Vec::new(),
             modal_message_total: 0,
             modal_unattributed: None,
@@ -252,10 +291,10 @@ impl UiDataCache {
         match view {
             ViewMode::Overview => {
                 self.hero_last = None;
-                self.recent_last = None;
+                self.wrapped_last = None;
             }
-            ViewMode::TopSpending => {
-                self.top_spending_last = None;
+            ViewMode::Sessions => {
+                self.sessions_last = None;
             }
             ViewMode::Stats => {
                 self.stats_last = None;
@@ -273,8 +312,6 @@ impl UiDataCache {
         today: NaiveDate,
         runtime: &Handle,
         storage: &Storage,
-        view: &RecentSessionViewState,
-        max_limit: usize,
         alerts: &AlertSettings,
     ) {
         if Self::should_refresh(self.hero_last, SUMMARY_REFRESH_INTERVAL, now) {
@@ -284,67 +321,69 @@ impl UiDataCache {
             }
             self.hero_last = Some(now);
         }
+    }
 
-        let refresh_due = Self::should_refresh(self.recent_last, RECENT_REFRESH_INTERVAL, now);
-        if refresh_due || self.recent_total == 0 {
-            match runtime.block_on(storage.recent_sessions_count()) {
-                Ok(total) => self.recent_total = total,
-                Err(err) => tracing::warn!(error = %err, "failed to count recent sessions"),
+    fn refresh_sessions(
+        &mut self,
+        now: Instant,
+        now_local: DateTime<Local>,
+        runtime: &Handle,
+        storage: &Storage,
+        view: &mut SessionsViewState,
+        max_limit: usize,
+    ) {
+        let key = (view.nav.range, view.nav.anchor, view.sort);
+        let key_changed = self.sessions_key != Some(key);
+        if key_changed {
+            self.sessions_key = Some(key);
+            self.sessions_last = None;
+            view.reset();
+        }
+
+        let refresh_due = Self::should_refresh(self.sessions_last, RECENT_REFRESH_INTERVAL, now);
+        let period = period_for_range(view.nav.range, view.nav.anchor, now_local);
+        if refresh_due || self.sessions_total == 0 || key_changed {
+            match runtime.block_on(storage.sessions_count_between(period.start, period.end)) {
+                Ok(total) => self.sessions_total = total,
+                Err(err) => tracing::warn!(error = %err, "failed to count sessions"),
             }
         }
 
-        let (offset, limit) = recent_window_for(view, self.recent_total, max_limit);
-        let window_changed = offset != self.recent_offset || limit != self.recent_limit;
+        let (offset, limit) = sessions_window_for(view, self.sessions_total, max_limit);
+        let window_changed = offset != self.sessions_offset || limit != self.sessions_limit;
 
         if refresh_due || window_changed {
-            if self.recent_total == 0 || limit == 0 {
-                self.recent_sessions.clear();
-                self.recent_offset = 0;
-                self.recent_limit = 0;
-                self.recent_last = Some(now);
+            if self.sessions_total == 0 || limit == 0 {
+                self.sessions_rows.clear();
+                self.sessions_offset = 0;
+                self.sessions_limit = 0;
+                self.sessions_last = Some(now);
                 return;
             }
 
-            match runtime.block_on(storage.recent_sessions_page(offset, limit)) {
+            let result = match view.sort {
+                SessionSort::Recent => runtime.block_on(storage.sessions_page_by_recent_between(
+                    period.start,
+                    period.end,
+                    offset,
+                    limit,
+                )),
+                SessionSort::Cost => runtime.block_on(storage.sessions_page_by_cost_between(
+                    period.start,
+                    period.end,
+                    offset,
+                    limit,
+                )),
+            };
+            match result {
                 Ok(rows) => {
-                    self.recent_sessions = rows;
-                    self.recent_offset = offset;
-                    self.recent_limit = limit;
+                    self.sessions_rows = rows;
+                    self.sessions_offset = offset;
+                    self.sessions_limit = limit;
                 }
-                Err(err) => tracing::warn!(error = %err, "failed to load recent sessions page"),
+                Err(err) => tracing::warn!(error = %err, "failed to load sessions page"),
             }
-            self.recent_last = Some(now);
-        }
-    }
-
-    fn refresh_top_spending(
-        &mut self,
-        now_local: DateTime<Local>,
-        now_instant: Instant,
-        runtime: &Handle,
-        storage: &Storage,
-        limit: usize,
-        nav: &TimeNavState,
-    ) {
-        let key = (nav.range, nav.anchor);
-        let key_changed = self.top_spending_key != Some(key);
-        if key_changed {
-            self.top_spending_key = Some(key);
-            self.top_spending_last = None;
-        }
-        if Self::should_refresh(
-            self.top_spending_last,
-            TOP_SPENDING_REFRESH_INTERVAL,
-            now_instant,
-        ) {
-            let period = period_for_range(nav.range, nav.anchor, now_local);
-            match runtime.block_on(storage.top_sessions_between(period.start, period.end, limit)) {
-                Ok(rows) => {
-                    self.top_spending_rows = rows;
-                }
-                Err(err) => tracing::warn!(error = %err, "failed to load top spending sessions"),
-            }
-            self.top_spending_last = Some(now_instant);
+            self.sessions_last = Some(now);
         }
     }
 
@@ -370,6 +409,33 @@ impl UiDataCache {
                 Err(err) => tracing::warn!(error = %err, "failed to gather stats data"),
             }
             self.stats_last = Some(now);
+        }
+    }
+
+    fn refresh_wrapped(
+        &mut self,
+        now: Instant,
+        now_local: DateTime<Local>,
+        runtime: &Handle,
+        storage: &Storage,
+        view: &WrappedViewState,
+    ) {
+        let year = view.year;
+        let year_changed = self.wrapped_year != Some(year);
+        let ingest_changed =
+            self.last_ingest.is_some() && self.wrapped_ingest_at != self.last_ingest;
+        let refresh_due = year_changed
+            || Self::should_refresh(self.wrapped_last, WRAPPED_REFRESH_INTERVAL, now)
+            || ingest_changed;
+
+        if refresh_due {
+            match runtime.block_on(WrappedStats::gather(storage, year, now_local)) {
+                Ok(stats) => self.wrapped_data = Some(stats),
+                Err(err) => tracing::warn!(error = %err, "failed to gather wrapped stats"),
+            }
+            self.wrapped_year = Some(year);
+            self.wrapped_last = Some(now);
+            self.wrapped_ingest_at = self.last_ingest;
         }
     }
 
@@ -553,10 +619,10 @@ fn run_blocking(
     tick_rate: Duration,
 ) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let mut overview_view = RecentSessionViewState::new();
-    let mut top_spending_view = TopSpendingViewState::new();
+    let mut sessions_view = SessionsViewState::new();
     let mut stats_view = StatsViewState::new();
     let mut pricing_view = PricingViewState::new();
+    let mut wrapped_view = WrappedViewState::new(Local::now().date_naive());
     let mut session_modal = SessionModalState::new();
     let mut missing_modal = MissingPriceModalState::new();
     let mut help_modal = HelpModalState::new();
@@ -577,17 +643,16 @@ fn run_blocking(
                 should_quit = handle_key_event(
                     key,
                     &mut view_mode,
-                    &mut overview_view,
-                    &mut top_spending_view,
+                    &mut sessions_view,
                     &mut stats_view,
                     &mut pricing_view,
+                    &mut wrapped_view,
                     &mut session_modal,
                     &mut missing_modal,
                     &mut help_modal,
-                    &cache.recent_sessions,
-                    cache.recent_total,
-                    cache.recent_offset,
-                    &cache.top_spending_rows,
+                    &cache.sessions_rows,
+                    cache.sessions_total,
+                    cache.sessions_offset,
                     &cache.modal_messages,
                     cache.modal_unattributed.as_ref(),
                     &cache.modal_turns_by_message,
@@ -610,17 +675,16 @@ fn run_blocking(
                     should_quit = handle_key_event(
                         key,
                         &mut view_mode,
-                        &mut overview_view,
-                        &mut top_spending_view,
+                        &mut sessions_view,
                         &mut stats_view,
                         &mut pricing_view,
+                        &mut wrapped_view,
                         &mut session_modal,
                         &mut missing_modal,
                         &mut help_modal,
-                        &cache.recent_sessions,
-                        cache.recent_total,
-                        cache.recent_offset,
-                        &cache.top_spending_rows,
+                        &cache.sessions_rows,
+                        cache.sessions_total,
+                        cache.sessions_offset,
                         &cache.modal_messages,
                         cache.modal_unattributed.as_ref(),
                         &cache.modal_turns_by_message,
@@ -655,27 +719,19 @@ fn run_blocking(
 
             match view_mode {
                 ViewMode::Overview => {
-                    cache.refresh_overview(
-                        now,
-                        today,
-                        &runtime,
-                        &storage,
-                        &overview_view,
-                        session_limit,
-                        &alerts,
-                    );
-                    overview_view.sync_with(cache.recent_total);
+                    cache.refresh_overview(now, today, &runtime, &storage, &alerts);
+                    cache.refresh_wrapped(now, now_local, &runtime, &storage, &wrapped_view);
                 }
-                ViewMode::TopSpending => {
-                    cache.refresh_top_spending(
-                        now_local,
+                ViewMode::Sessions => {
+                    cache.refresh_sessions(
                         now,
+                        now_local,
                         &runtime,
                         &storage,
+                        &mut sessions_view,
                         session_limit,
-                        &top_spending_view.nav,
                     );
-                    top_spending_view.sync_with(cache.top_spending_rows.len());
+                    sessions_view.sync_with(cache.sessions_total);
                 }
                 ViewMode::Stats => {
                     cache.refresh_stats(
@@ -694,10 +750,9 @@ fn run_blocking(
             }
 
             let selected_session = match view_mode {
-                ViewMode::Overview => {
-                    overview_view.selected(&cache.recent_sessions, cache.recent_offset)
+                ViewMode::Sessions => {
+                    sessions_view.selected(&cache.sessions_rows, cache.sessions_offset)
                 }
-                ViewMode::TopSpending => top_spending_view.selected(&cache.top_spending_rows),
                 _ => None,
             }
             .cloned();
@@ -731,6 +786,11 @@ fn run_blocking(
             } else {
                 None
             };
+            let wrapped_data = if matches!(view_mode, ViewMode::Overview) {
+                cache.wrapped_data.as_ref()
+            } else {
+                None
+            };
             let (pricing_rows, pricing_missing, pricing_meta) =
                 if matches!(view_mode, ViewMode::Pricing) {
                     (
@@ -744,16 +804,14 @@ fn run_blocking(
             terminal.draw(|frame| {
                 draw_ui(
                     frame,
-                    &config,
                     &cache.hero,
-                    &cache.recent_sessions,
-                    cache.recent_total,
-                    cache.recent_offset,
-                    &mut overview_view,
-                    &cache.top_spending_rows,
-                    &mut top_spending_view,
+                    &cache.sessions_rows,
+                    cache.sessions_total,
+                    cache.sessions_offset,
+                    &mut sessions_view,
                     &stats_view,
                     &mut pricing_view,
+                    &wrapped_view,
                     &missing_modal,
                     &help_modal,
                     selected_session.as_ref(),
@@ -766,6 +824,7 @@ fn run_blocking(
                     &cache.modal_tool_counts,
                     &mut session_modal,
                     stats_data,
+                    wrapped_data,
                     pricing_rows,
                     pricing_missing,
                     pricing_meta,
@@ -806,16 +865,14 @@ fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) -> Result<
 #[allow(clippy::too_many_arguments)]
 fn draw_ui(
     frame: &mut Frame,
-    config: &AppConfig,
     hero: &HeroStats,
-    recent_sessions: &[SessionAggregate],
-    recent_total: usize,
-    recent_offset: usize,
-    overview_view: &mut RecentSessionViewState,
-    top_spending_rows: &[SessionAggregate],
-    top_spending_view: &mut TopSpendingViewState,
+    sessions_rows: &[SessionAggregate],
+    sessions_total: usize,
+    sessions_offset: usize,
+    sessions_view: &mut SessionsViewState,
     stats_view: &StatsViewState,
     pricing_view: &mut PricingViewState,
+    wrapped_view: &WrappedViewState,
     missing_modal: &MissingPriceModalState,
     help_modal: &HelpModalState,
     selected: Option<&SessionAggregate>,
@@ -828,6 +885,7 @@ fn draw_ui(
     tool_counts: &[ToolCountRow],
     session_modal: &mut SessionModalState,
     stats_data: Option<&StatsRangeData>,
+    wrapped_data: Option<&WrappedStats>,
     pricing_rows: Option<&[PriceRow]>,
     pricing_missing: Option<&[MissingPriceDetail]>,
     pricing_meta: Option<&PricingMeta>,
@@ -849,19 +907,18 @@ fn draw_ui(
         ViewMode::Overview => draw_overview(
             frame,
             layout[1],
-            config,
             hero,
-            recent_sessions,
-            recent_total,
-            recent_offset,
-            overview_view,
+            wrapped_data,
+            wrapped_view,
             dim_background,
         ),
-        ViewMode::TopSpending => draw_top_spending_view(
+        ViewMode::Sessions => draw_sessions_view(
             frame,
             layout[1],
-            top_spending_rows,
-            top_spending_view,
+            sessions_rows,
+            sessions_total,
+            sessions_offset,
+            sessions_view,
             dim_background,
         ),
         ViewMode::Stats => {
@@ -918,44 +975,76 @@ fn draw_ui(
 fn draw_overview(
     frame: &mut Frame,
     area: Rect,
-    _config: &AppConfig,
     stats: &HeroStats,
-    recent_sessions: &[SessionAggregate],
-    recent_total: usize,
-    recent_offset: usize,
-    view: &mut RecentSessionViewState,
+    wrapped_data: Option<&WrappedStats>,
+    wrapped_view: &WrappedViewState,
     dim: bool,
 ) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(10)])
+        .constraints([Constraint::Length(6), Constraint::Min(0)])
         .split(area);
 
     render_hero_cards(frame, layout[0], stats, dim);
-    render_recent_sessions(
-        frame,
-        layout[1],
-        recent_sessions,
-        recent_total,
-        recent_offset,
-        view,
-        dim,
-    );
+
+    let theme = ui_theme(dim);
+    let wrapped_area = layout[1];
+    match wrapped_data {
+        Some(stats) if stats.has_activity() => {
+            let wrapped_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(10),
+                    Constraint::Length(11),
+                    Constraint::Length(9),
+                    Constraint::Min(0),
+                ])
+                .split(wrapped_area);
+            render_wrapped_hero(frame, wrapped_layout[0], stats, &theme);
+            render_wrapped_heatmap(frame, wrapped_layout[1], stats, &theme);
+            render_wrapped_bottom(frame, wrapped_layout[2], stats, &theme);
+        }
+        Some(_) => {
+            render_overview_placeholder(
+                frame,
+                wrapped_area,
+                wrapped_view.year,
+                format!("No Codex activity found for {}.", wrapped_view.year),
+                &theme,
+            );
+        }
+        None => {
+            render_overview_placeholder(
+                frame,
+                wrapped_area,
+                wrapped_view.year,
+                "Loading annual stats…".to_string(),
+                &theme,
+            );
+        }
+    }
 }
 
-fn draw_top_spending_view(
+fn draw_sessions_view(
     frame: &mut Frame,
     area: Rect,
     sessions: &[SessionAggregate],
-    view: &mut TopSpendingViewState,
+    total: usize,
+    offset: usize,
+    view: &mut SessionsViewState,
     dim: bool,
 ) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(area);
-    render_time_nav(frame, layout[0], &view.nav, dim);
-    render_top_spending_table(frame, layout[1], sessions, view, dim);
+    let top_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(layout[0]);
+    render_time_nav(frame, top_layout[0], &view.nav, dim);
+    render_sort_nav(frame, top_layout[1], view.sort, dim);
+    render_sessions_table(frame, layout[1], sessions, total, offset, view, dim);
 }
 
 fn draw_stats_view(
@@ -971,6 +1060,303 @@ fn draw_stats_view(
         .split(area);
     render_time_nav(frame, layout[0], &view.nav, dim);
     render_stats_table(frame, layout[1], stats, dim);
+}
+
+fn render_wrapped_hero(frame: &mut Frame, area: Rect, stats: &WrappedStats, theme: &UiTheme) {
+    let most_active = stats
+        .most_active_day
+        .map(|(date, tokens)| format!("{} ({})", date.format("%b %d"), format_tokens(tokens)))
+        .unwrap_or_else(|| "—".to_string());
+    let streak_value = if stats.current_streak > 0 {
+        format!("{}d ({}d now)", stats.max_streak, stats.current_streak)
+    } else {
+        format!("{}d", stats.max_streak)
+    };
+    let started_value = format!(
+        "{} ({}d ago)",
+        stats.first_session_date.format("%b %d"),
+        stats.days_since_first_session
+    );
+
+    let block = gray_block("Overview", theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    let year_line = Paragraph::new(year_control_line(stats.year, theme));
+    frame.render_widget(year_line, layout[0]);
+    let spacer = Paragraph::new(Line::from(""));
+    frame.render_widget(spacer, layout[1]);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(48),
+            Constraint::Length(2),
+            Constraint::Percentage(48),
+        ])
+        .split(layout[2]);
+
+    let usage_items = vec![
+        ("Sessions".to_string(), format_tokens(stats.total_sessions)),
+        ("Messages".to_string(), format_tokens(stats.total_messages)),
+        (
+            "Tokens".to_string(),
+            format_tokens(stats.totals.total_tokens),
+        ),
+        ("Cost".to_string(), format_cost(stats.totals.cost_usd)),
+    ];
+    let context_items = vec![
+        ("Projects".to_string(), format_tokens(stats.total_projects)),
+        ("Streak".to_string(), streak_value),
+        ("Most Active".to_string(), most_active),
+        ("Started".to_string(), started_value),
+    ];
+
+    let usage_lines = overview_cluster_lines("Usage", &usage_items, theme);
+    let context_lines = overview_cluster_lines("Context", &context_items, theme);
+
+    let usage = Paragraph::new(usage_lines).style(Style::default().fg(theme.text_fg));
+    let context = Paragraph::new(context_lines).style(Style::default().fg(theme.text_fg));
+    frame.render_widget(usage, columns[0]);
+    frame.render_widget(context, columns[2]);
+}
+
+fn overview_cluster_lines(
+    title: &str,
+    items: &[(String, String)],
+    theme: &UiTheme,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(items.len().saturating_add(2));
+    let header_style = Style::default()
+        .fg(theme.header_fg)
+        .add_modifier(Modifier::BOLD);
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(title.to_string(), header_style),
+    ]));
+    lines.push(Line::from(""));
+
+    let label_width = items
+        .iter()
+        .map(|(label, _)| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (label, value) in items {
+        let label_pad = pad_right(label, label_width);
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(label_pad, Style::default().fg(theme.label_fg)),
+            Span::raw("  "),
+            Span::styled(
+                value.to_string(),
+                Style::default()
+                    .fg(theme.text_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    lines
+}
+
+fn render_wrapped_heatmap(frame: &mut Frame, area: Rect, stats: &WrappedStats, theme: &UiTheme) {
+    let weeks = heatmap_weeks_for_year(stats.year, stats.end_date);
+    let max_tokens = stats.daily_tokens.values().copied().max().unwrap_or(0);
+    if weeks.is_empty() {
+        let paragraph = Paragraph::new("No activity yet.")
+            .block(gray_block("Token Activity", theme))
+            .style(Style::default().fg(theme.text_fg));
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let mut lines = Vec::with_capacity(8);
+    for (row_idx, label) in weekday_labels.iter().enumerate() {
+        let mut spans = vec![Span::styled(
+            format!("{label} "),
+            Style::default().fg(theme.label_fg),
+        )];
+        for (week_idx, week) in weeks.iter().enumerate() {
+            if week_idx > 0 {
+                spans.push(Span::raw(" "));
+            }
+            let date = week[row_idx];
+            let count = date
+                .and_then(|d| stats.daily_tokens.get(&d).copied())
+                .unwrap_or(0);
+            let intensity = heatmap_intensity(count, max_tokens);
+            let palette = if date
+                .map(|d| stats.max_streak_days.contains(&d))
+                .unwrap_or(false)
+            {
+                STREAK_COLORS
+            } else {
+                HEATMAP_COLORS
+            };
+            let color = palette[intensity];
+            spans.push(Span::styled("  ".to_string(), Style::default().bg(color)));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let content_width = area.width.saturating_sub(2);
+    lines.push(Line::from(""));
+    lines.push(heatmap_legend_line(theme, content_width));
+
+    let paragraph = Paragraph::new(lines)
+        .block(gray_block("Token Activity (Mon–Sun)", theme))
+        .style(Style::default().fg(theme.text_fg));
+    frame.render_widget(paragraph, area);
+}
+
+fn heatmap_legend_line(theme: &UiTheme, width: u16) -> Line<'static> {
+    let mut spans = vec![Span::styled("Less ", Style::default().fg(theme.label_fg))];
+    let mut left_len = "Less ".chars().count();
+    for (idx, color) in HEATMAP_COLORS.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw(" "));
+            left_len += 1;
+        }
+        spans.push(Span::styled("  ".to_string(), Style::default().bg(*color)));
+        left_len += 2;
+    }
+    spans.push(Span::styled(" More", Style::default().fg(theme.label_fg)));
+    left_len += " More".chars().count();
+
+    let gap = 7usize; // 2 squares + 3 spaces between squares
+    let total_width = width as usize;
+    let right_label = "Streak ";
+    let streak_squares_len = STREAK_COLORS.len() * 2 + STREAK_COLORS.len().saturating_sub(1);
+    let min_right_len = right_label.chars().count() + streak_squares_len;
+    if total_width <= left_len + gap + min_right_len {
+        return Line::from(spans);
+    }
+    spans.push(Span::raw(" ".repeat(gap)));
+
+    let mut right_tail = " max streak days".to_string();
+    let available = total_width.saturating_sub(left_len + gap + min_right_len);
+    if available < right_tail.chars().count() {
+        right_tail = if available == 0 {
+            String::new()
+        } else {
+            truncate_text(&right_tail, available)
+        };
+    }
+    spans.push(Span::styled(
+        right_label.to_string(),
+        Style::default().fg(theme.label_fg),
+    ));
+    for (idx, color) in STREAK_COLORS.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled("  ".to_string(), Style::default().bg(*color)));
+    }
+    spans.push(Span::styled(
+        right_tail,
+        Style::default().fg(theme.label_fg),
+    ));
+    Line::from(spans)
+}
+
+fn render_wrapped_bottom(frame: &mut Frame, area: Rect, stats: &WrappedStats, theme: &UiTheme) {
+    let layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    render_wrapped_top_models(frame, layout[0], stats, theme);
+    render_wrapped_weekday(frame, layout[1], stats, theme);
+}
+
+fn render_wrapped_top_models(frame: &mut Frame, area: Rect, stats: &WrappedStats, theme: &UiTheme) {
+    let mut lines = Vec::new();
+    if stats.top_models.is_empty() {
+        lines.push(Line::from("No model data."));
+    } else {
+        let model_width = 24usize;
+        let tokens_width = 8u16;
+        let pct_width = 6u16;
+        for (idx, model) in stats.top_models.iter().take(5).enumerate() {
+            let pct = model.share * 100.0;
+            let name = pad_right(&truncate_text(&model.model, model_width), model_width);
+            let label = format!("{:>2}. {}", idx + 1, name);
+            let tokens = align_right(format_tokens(model.tokens), tokens_width);
+            let pct_label = align_right(format!("{pct:.1}%"), pct_width);
+            let line = Line::from(vec![
+                Span::styled(label, Style::default().fg(theme.text_fg)),
+                Span::raw("  "),
+                Span::styled(tokens, Style::default().fg(theme.label_fg)),
+                Span::raw("  "),
+                Span::styled(pct_label, Style::default().fg(theme.label_fg)),
+            ]);
+            lines.push(line);
+        }
+    }
+    let paragraph = Paragraph::new(lines)
+        .block(gray_block("Top Models", theme))
+        .style(Style::default().fg(theme.text_fg));
+    frame.render_widget(paragraph, area);
+}
+
+fn render_wrapped_weekday(frame: &mut Frame, area: Rect, stats: &WrappedStats, theme: &UiTheme) {
+    let labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let max = stats.weekday_tokens.iter().copied().max().unwrap_or(0);
+    let label_width = 4u16;
+    let content_width = area.width.saturating_sub(2);
+    let preferred_value_width = 14u16;
+    let min_value_width = 8u16;
+    let max_value_width = content_width.saturating_sub(label_width + 1);
+    let value_width = if max_value_width == 0 {
+        0
+    } else {
+        preferred_value_width
+            .min(max_value_width)
+            .max(min_value_width.min(max_value_width))
+    };
+    let right_padding = if value_width > 0 { 1 } else { 0 };
+    let bar_width = content_width
+        .saturating_sub(label_width)
+        .saturating_sub(value_width)
+        .saturating_sub(1)
+        .saturating_sub(right_padding) as usize;
+    let bar_width = bar_width.max(1);
+    let mut lines = Vec::new();
+    for (idx, label) in labels.iter().enumerate() {
+        let count = stats.weekday_tokens[idx];
+        let ratio = if max > 0 {
+            count as f64 / max as f64
+        } else {
+            0.0
+        };
+        let bar = ratio_bar(ratio, bar_width);
+        let intensity = heatmap_intensity(count, max);
+        let bar_color = HEATMAP_COLORS[intensity];
+        let value_label = if value_width == 0 {
+            String::new()
+        } else {
+            align_right(format_tokens(count), value_width)
+        };
+        let line = Line::from(vec![
+            Span::styled(format!("{label} "), Style::default().fg(theme.label_fg)),
+            Span::styled(bar, Style::default().fg(bar_color)),
+            Span::raw(" "),
+            Span::styled(value_label, Style::default().fg(theme.label_fg)),
+            Span::raw(if right_padding > 0 { " " } else { "" }),
+        ]);
+        lines.push(line);
+    }
+    let paragraph = Paragraph::new(lines)
+        .block(gray_block("Weekday Tokens (Mon–Sun)", theme))
+        .style(Style::default().fg(theme.text_fg));
+    frame.render_widget(paragraph, area);
 }
 
 fn render_stats_table(frame: &mut Frame, area: Rect, stats: Option<&StatsRangeData>, dim: bool) {
@@ -1350,11 +1736,24 @@ fn render_help_modal(frame: &mut Frame, view_mode: ViewMode) {
         Line::from("  ?            toggle help"),
     ];
 
-    if matches!(view_mode, ViewMode::TopSpending | ViewMode::Stats) {
+    if matches!(view_mode, ViewMode::Sessions | ViewMode::Stats) {
         lines.push(Line::from(""));
         lines.push(Line::from("Time Navigation"));
         lines.push(Line::from("  h/l or ←/→   prev/next period"));
         lines.push(Line::from("  d/w/m/y/a    day/week/month/year/all"));
+    }
+
+    if matches!(view_mode, ViewMode::Sessions) {
+        lines.push(Line::from(""));
+        lines.push(Line::from("Sorting"));
+        lines.push(Line::from("  r            recent"));
+        lines.push(Line::from("  c            cost"));
+    }
+
+    if matches!(view_mode, ViewMode::Overview) {
+        lines.push(Line::from(""));
+        lines.push(Line::from("Overview"));
+        lines.push(Line::from("  h/l or ←/→   prev/next year"));
     }
 
     let paragraph = Paragraph::new(lines)
@@ -1387,8 +1786,8 @@ fn visible_rows_for_table(area: Rect) -> usize {
     area.height.saturating_sub(3) as usize
 }
 
-fn recent_window_for(
-    view: &RecentSessionViewState,
+fn sessions_window_for(
+    view: &SessionsViewState,
     total_rows: usize,
     max_limit: usize,
 ) -> (usize, usize) {
@@ -1569,7 +1968,7 @@ fn render_navbar(frame: &mut Frame, area: Rect, view_mode: ViewMode, dim: bool) 
     let theme = ui_theme(dim);
     let tabs = [
         (ViewMode::Overview, "1 Overview"),
-        (ViewMode::TopSpending, "2 Top Spending"),
+        (ViewMode::Sessions, "2 Sessions"),
         (ViewMode::Stats, "3 Stats"),
         (ViewMode::Pricing, "4 Pricing"),
     ];
@@ -1646,6 +2045,20 @@ fn render_time_nav(frame: &mut Frame, area: Rect, nav: &TimeNavState, dim: bool)
 
     let paragraph = Paragraph::new(Line::from(spans))
         .block(gray_block("Time Range", &theme))
+        .style(Style::default().fg(theme.text_fg));
+    frame.render_widget(paragraph, area);
+}
+
+fn render_sort_nav(frame: &mut Frame, area: Rect, sort: SessionSort, dim: bool) {
+    let theme = ui_theme(dim);
+    let mut spans = vec![Span::raw(" ")];
+    let (recent_spans, _) = range_tab_spans("RECENT", 'R', sort == SessionSort::Recent, &theme);
+    let (cost_spans, _) = range_tab_spans("COST", 'C', sort == SessionSort::Cost, &theme);
+    spans.extend(recent_spans);
+    spans.push(Span::raw(" "));
+    spans.extend(cost_spans);
+    let paragraph = Paragraph::new(Line::from(spans))
+        .block(gray_block("Sort", &theme))
         .style(Style::default().fg(theme.text_fg));
     frame.render_widget(paragraph, area);
 }
@@ -1766,19 +2179,21 @@ fn render_hero_cards(frame: &mut Frame, area: Rect, stats: &HeroStats, dim: bool
     let layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(34),
+            Constraint::Percentage(60),
             Constraint::Length(1),
-            Constraint::Percentage(33),
-            Constraint::Length(1),
-            Constraint::Percentage(33),
+            Constraint::Min(0),
         ])
         .split(inner);
 
-    render_hero_card(frame, layout[0], "TODAY", &stats.today, &theme);
+    render_hero_card(frame, layout[0], "TODAY", &stats.today, &theme, true);
     render_vertical_divider(frame, layout[1], &theme);
-    render_hero_card(frame, layout[2], "THIS WEEK", &stats.week, &theme);
-    render_vertical_divider(frame, layout[3], &theme);
-    render_hero_card(frame, layout[4], "THIS MONTH", &stats.month, &theme);
+
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(layout[2]);
+    render_hero_card(frame, right[0], "THIS WEEK", &stats.week, &theme, false);
+    render_hero_card(frame, right[1], "THIS MONTH", &stats.month, &theme, false);
 }
 
 fn render_hero_card(
@@ -1787,19 +2202,40 @@ fn render_hero_card(
     title: &str,
     metric: &HeroMetric,
     theme: &UiTheme,
+    primary: bool,
 ) {
-    let area = Rect {
+    let mut content = Rect {
         x: area.x.saturating_add(1),
         y: area.y,
         width: area.width.saturating_sub(1),
         height: area.height,
     };
+    if primary && area.width > 0 {
+        let bar_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: 1,
+            height: area.height,
+        };
+        let lines: Vec<Line> = (0..bar_area.height)
+            .map(|_| Line::from(Span::styled("▌", Style::default().fg(theme.header_fg))))
+            .collect();
+        let paragraph = Paragraph::new(lines);
+        frame.render_widget(paragraph, bar_area);
+        if content.width > 0 {
+            content.x = content.x.saturating_add(1);
+            content.width = content.width.saturating_sub(1);
+        }
+    }
     let cost = format_cost_short(metric.total.cost_usd);
+    let cost_color = if primary {
+        theme.highlight_fg
+    } else {
+        Color::White
+    };
     let cost_span = Span::styled(
         cost,
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(cost_color).add_modifier(Modifier::BOLD),
     );
     let delta_span = match metric.delta {
         Some(delta) => {
@@ -1820,10 +2256,20 @@ fn render_hero_card(
     let session_label = format_count_short(metric.session_count);
     let message_label = format_count_short(metric.message_count);
     metric_spans.push(Span::raw("  "));
-    metric_spans.push(Span::styled(
-        format!("S {session_label} • M {message_label}"),
-        Style::default().fg(theme.label_fg),
-    ));
+    let meta_color = if primary {
+        theme.highlight_fg
+    } else {
+        theme.label_fg
+    };
+    let label_style = Style::default()
+        .fg(theme.label_fg)
+        .add_modifier(Modifier::DIM);
+    let value_style = Style::default().fg(meta_color);
+    metric_spans.push(Span::styled("Sessions ", label_style));
+    metric_spans.push(Span::styled(session_label, value_style));
+    metric_spans.push(Span::raw(" • "));
+    metric_spans.push(Span::styled("Messages ", label_style));
+    metric_spans.push(Span::styled(message_label, value_style));
     if let (Some(budget), Some(cost)) = (metric.budget, metric.total.cost_usd)
         && let Some(bar_spans) = budget_bar_with_percent(cost, budget, 10)
     {
@@ -1831,20 +2277,25 @@ fn render_hero_card(
         metric_spans.extend(bar_spans);
     }
 
-    let lines = vec![
-        Line::from(Span::styled(
-            format!(" {title} "),
-            Style::default()
-                .fg(theme.header_fg)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(metric_spans),
-    ];
+    let title_style = if primary {
+        Style::default()
+            .fg(theme.highlight_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(theme.header_fg)
+            .add_modifier(Modifier::BOLD)
+    };
+    let mut lines = vec![Line::from(Span::styled(format!(" {title} "), title_style))];
+    if content.height > 2 {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(metric_spans));
 
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(theme.text_fg))
         .wrap(Wrap { trim: true });
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, content);
 }
 
 fn budget_bar_with_percent(cost: f64, budget: f64, width: usize) -> Option<Vec<Span<'static>>> {
@@ -1901,13 +2352,13 @@ fn render_vertical_divider(frame: &mut Frame, area: Rect, theme: &UiTheme) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_recent_sessions(
+fn render_sessions_table(
     frame: &mut Frame,
     area: Rect,
     sessions: &[SessionAggregate],
     total_sessions: usize,
     window_offset: usize,
-    view: &mut RecentSessionViewState,
+    view: &mut SessionsViewState,
     dim: bool,
 ) {
     let theme = ui_theme(dim);
@@ -1916,7 +2367,7 @@ fn render_recent_sessions(
     view.list.set_visible_rows(visible_rows, total);
     let (page, pages) = view.list.page_info(total);
     let title = format!(
-        "Recent Sessions – {total} total • page {page}/{pages} (↑/↓ PgUp/PgDn navigate, Enter details)"
+        "Sessions – {total} total • page {page}/{pages} (↑/↓ PgUp/PgDn navigate, Enter details)"
     );
     let empty_state = if total > 0 && sessions.is_empty() {
         Some(EmptyState::Loading)
@@ -1936,32 +2387,46 @@ fn render_recent_sessions(
     );
 }
 
-fn render_top_spending_table(
+fn year_control_line(year: i32, theme: &UiTheme) -> Line<'static> {
+    let label_style = Style::default()
+        .fg(theme.highlight_fg)
+        .bg(theme.highlight_bg)
+        .add_modifier(Modifier::BOLD);
+    let arrow_style = Style::default().fg(theme.text_fg);
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled("◀ ", arrow_style),
+        Span::styled(format!(" {year} "), label_style),
+        Span::styled(" ▶", arrow_style),
+    ])
+}
+
+fn render_overview_placeholder(
     frame: &mut Frame,
     area: Rect,
-    sessions: &[SessionAggregate],
-    view: &mut TopSpendingViewState,
-    dim: bool,
+    year: i32,
+    message: String,
+    theme: &UiTheme,
 ) {
-    let theme = ui_theme(dim);
-    let total = sessions.len();
-    let visible_rows = visible_rows_for_table(area);
-    view.list.set_visible_rows(visible_rows, total);
-    let (page, pages) = view.list.page_info(total);
-    let title = format!(
-        "Top Spending – {total} sessions • page {page}/{pages} (↑/↓ PgUp/PgDn, Enter details)"
-    );
-    render_session_list_table(
-        frame,
-        area,
-        sessions,
-        &mut view.list,
-        title,
-        &theme,
-        None,
-        total,
-        0,
-    );
+    let block = gray_block("Overview", theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    let year_line = Paragraph::new(year_control_line(year, theme));
+    frame.render_widget(year_line, layout[0]);
+    let spacer = Paragraph::new(Line::from(""));
+    frame.render_widget(spacer, layout[1]);
+
+    let paragraph = Paragraph::new(message).style(Style::default().fg(theme.text_fg));
+    frame.render_widget(paragraph, layout[2]);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2861,17 +3326,16 @@ fn format_model_effort(model: &str, effort: Option<&str>, max_width: usize) -> S
 fn handle_key_event(
     key: KeyEvent,
     view_mode: &mut ViewMode,
-    overview_view: &mut RecentSessionViewState,
-    top_spending_view: &mut TopSpendingViewState,
+    sessions_view: &mut SessionsViewState,
     stats_view: &mut StatsViewState,
     pricing_view: &mut PricingViewState,
+    wrapped_view: &mut WrappedViewState,
     session_modal: &mut SessionModalState,
     missing_modal: &mut MissingPriceModalState,
     help_modal: &mut HelpModalState,
-    recent_sessions: &[SessionAggregate],
-    recent_total: usize,
-    recent_offset: usize,
-    top_spending_rows: &[SessionAggregate],
+    sessions_rows: &[SessionAggregate],
+    sessions_total: usize,
+    sessions_offset: usize,
     modal_messages: &[SessionMessage],
     modal_unattributed: Option<&SessionMessage>,
     modal_turns_by_message: &HashMap<MessageGroupKey, Vec<SessionTurn>>,
@@ -2908,8 +3372,7 @@ fn handle_key_event(
 
     if session_modal.is_open() {
         let selected_session = match *view_mode {
-            ViewMode::Overview => overview_view.selected(recent_sessions, recent_offset),
-            ViewMode::TopSpending => top_spending_view.selected(top_spending_rows),
+            ViewMode::Sessions => sessions_view.selected(sessions_rows, sessions_offset),
             _ => None,
         };
         if handle_session_modal_input(
@@ -2949,7 +3412,7 @@ fn handle_key_event(
             *view_mode = ViewMode::Overview;
         }
         KeyCode::Char('2') => {
-            *view_mode = ViewMode::TopSpending;
+            *view_mode = ViewMode::Sessions;
         }
         KeyCode::Char('3') => {
             *view_mode = ViewMode::Stats;
@@ -2964,8 +3427,12 @@ fn handle_key_event(
             *view_mode = ViewMode::Overview;
         }
         KeyCode::Left | KeyCode::Char('h') => match *view_mode {
-            ViewMode::TopSpending => {
-                top_spending_view.nav.move_prev();
+            ViewMode::Overview => {
+                wrapped_view.prev_year();
+            }
+            ViewMode::Sessions => {
+                sessions_view.nav.move_prev();
+                sessions_view.reset();
             }
             ViewMode::Stats => {
                 stats_view.nav.move_prev();
@@ -2973,8 +3440,12 @@ fn handle_key_event(
             _ => {}
         },
         KeyCode::Right | KeyCode::Char('l') => match *view_mode {
-            ViewMode::TopSpending => {
-                top_spending_view.nav.move_next();
+            ViewMode::Overview => {
+                wrapped_view.next_year();
+            }
+            ViewMode::Sessions => {
+                sessions_view.nav.move_next();
+                sessions_view.reset();
             }
             ViewMode::Stats => {
                 stats_view.nav.move_next();
@@ -2982,11 +3453,8 @@ fn handle_key_event(
             _ => {}
         },
         KeyCode::Up | KeyCode::Char('k') => match *view_mode {
-            ViewMode::Overview => {
-                overview_view.move_selection_up(recent_total);
-            }
-            ViewMode::TopSpending => {
-                top_spending_view.move_selection_up(top_spending_rows.len());
+            ViewMode::Sessions => {
+                sessions_view.move_selection_up(sessions_total);
             }
             ViewMode::Pricing => {
                 pricing_view.move_selection_up(pricing_rows.len());
@@ -2994,11 +3462,8 @@ fn handle_key_event(
             _ => {}
         },
         KeyCode::Down | KeyCode::Char('j') => match *view_mode {
-            ViewMode::Overview => {
-                overview_view.move_selection_down(recent_total);
-            }
-            ViewMode::TopSpending => {
-                top_spending_view.move_selection_down(top_spending_rows.len());
+            ViewMode::Sessions => {
+                sessions_view.move_selection_down(sessions_total);
             }
             ViewMode::Pricing => {
                 pricing_view.move_selection_down(pricing_rows.len());
@@ -3006,11 +3471,8 @@ fn handle_key_event(
             _ => {}
         },
         KeyCode::PageUp => match *view_mode {
-            ViewMode::Overview => {
-                overview_view.page_up(recent_total);
-            }
-            ViewMode::TopSpending => {
-                top_spending_view.page_up(top_spending_rows.len());
+            ViewMode::Sessions => {
+                sessions_view.page_up(sessions_total);
             }
             ViewMode::Pricing => {
                 pricing_view.page_up(pricing_rows.len());
@@ -3018,11 +3480,8 @@ fn handle_key_event(
             _ => {}
         },
         KeyCode::PageDown => match *view_mode {
-            ViewMode::Overview => {
-                overview_view.page_down(recent_total);
-            }
-            ViewMode::TopSpending => {
-                top_spending_view.page_down(top_spending_rows.len());
+            ViewMode::Sessions => {
+                sessions_view.page_down(sessions_total);
             }
             ViewMode::Pricing => {
                 pricing_view.page_down(pricing_rows.len());
@@ -3030,28 +3489,28 @@ fn handle_key_event(
             _ => {}
         },
         KeyCode::Enter => match *view_mode {
-            ViewMode::Overview => {
-                if let Some(selected) = overview_view.selected(recent_sessions, recent_offset) {
-                    session_modal.open_for(session_key(selected));
-                }
-            }
-            ViewMode::TopSpending => {
-                if let Some(selected) = top_spending_view.selected(top_spending_rows) {
+            ViewMode::Sessions => {
+                if let Some(selected) = sessions_view.selected(sessions_rows, sessions_offset) {
                     session_modal.open_for(session_key(selected));
                 }
             }
             _ => {}
         },
         KeyCode::Char(ch) => {
-            if matches!(view_mode, ViewMode::TopSpending | ViewMode::Stats)
+            if matches!(view_mode, ViewMode::Sessions | ViewMode::Stats)
                 && let Some(range) = TimeRange::from_key(ch)
             {
-                if matches!(view_mode, ViewMode::TopSpending) {
-                    top_spending_view.nav.set_range(range, today);
-                    top_spending_view.list.reset();
+                if matches!(view_mode, ViewMode::Sessions) {
+                    sessions_view.nav.set_range(range, today);
+                    sessions_view.reset();
                 } else {
                     stats_view.nav.set_range(range, today);
                 }
+            }
+            if matches!(view_mode, ViewMode::Sessions)
+                && let Some(sort) = SessionSort::from_key(ch)
+            {
+                sessions_view.set_sort(sort);
             }
         }
         _ => {}
@@ -3426,6 +3885,118 @@ impl StatsRangeData {
     }
 }
 
+struct WrappedModelStat {
+    model: String,
+    tokens: u64,
+    share: f64,
+}
+
+struct WrappedStats {
+    year: i32,
+    end_date: NaiveDate,
+    first_session_date: NaiveDate,
+    days_since_first_session: i64,
+    total_sessions: u64,
+    total_messages: u64,
+    total_projects: u64,
+    totals: AggregateTotals,
+    top_models: Vec<WrappedModelStat>,
+    daily_tokens: HashMap<NaiveDate, u64>,
+    most_active_day: Option<(NaiveDate, u64)>,
+    weekday_tokens: [u64; 7],
+    max_streak: u64,
+    current_streak: u64,
+    max_streak_days: HashSet<NaiveDate>,
+}
+
+impl WrappedStats {
+    async fn gather(storage: &Storage, year: i32, now_local: DateTime<Local>) -> Result<Self> {
+        let (start_date, end_date, start, end) = wrapped_year_bounds(year, now_local);
+        let totals = storage.totals_between_timestamps(start, end).await?;
+        let counts = storage.counts_between_timestamps(start, end).await?;
+        let daily_rows = storage.token_totals_by_day(start, end).await?;
+        let project_count = storage.project_count_between(start, end).await?;
+        let model_totals = storage.model_usage_by_tokens(start, end, 5).await?;
+        let first_session = storage
+            .first_session_timestamp()
+            .await?
+            .or(storage.first_turn_timestamp().await?);
+
+        let first_session_date = first_session
+            .map(|ts| ts.with_timezone(&Local).date_naive())
+            .unwrap_or(start_date);
+        let days_since_first_session = now_local
+            .date_naive()
+            .signed_duration_since(first_session_date)
+            .num_days()
+            .max(0);
+
+        let mut daily_tokens = HashMap::new();
+        let mut most_active_day: Option<(NaiveDate, u64)> = None;
+        let mut weekday_tokens = [0u64; 7];
+        for DailyTokenTotal { date, total_tokens } in daily_rows {
+            if total_tokens == 0 {
+                continue;
+            }
+            daily_tokens.insert(date, total_tokens);
+            let idx = date.weekday().num_days_from_monday() as usize;
+            weekday_tokens[idx] += total_tokens;
+            if most_active_day
+                .as_ref()
+                .map(|(_, max)| total_tokens > *max)
+                .unwrap_or(true)
+            {
+                most_active_day = Some((date, total_tokens));
+            }
+        }
+
+        let (max_streak, current_streak, max_streak_days) =
+            streak_stats_for_year(&daily_tokens, end_date);
+
+        let total_tokens = totals.total_tokens;
+        let model_total_tokens: u64 = model_totals.iter().map(|row| row.total_tokens).sum();
+        let denominator = if total_tokens > 0 {
+            total_tokens
+        } else {
+            model_total_tokens
+        };
+        let top_models = model_totals
+            .into_iter()
+            .map(|row| WrappedModelStat {
+                model: row.model,
+                tokens: row.total_tokens,
+                share: if denominator > 0 {
+                    row.total_tokens as f64 / denominator as f64
+                } else {
+                    0.0
+                },
+            })
+            .collect();
+
+        Ok(Self {
+            year,
+            end_date,
+            first_session_date,
+            days_since_first_session,
+            total_sessions: counts.session_count,
+            total_messages: counts.message_count,
+            total_projects: project_count,
+            totals,
+            top_models,
+            daily_tokens,
+            most_active_day,
+            weekday_tokens,
+            max_streak,
+            current_streak,
+            max_streak_days,
+        })
+    }
+
+    fn has_activity(&self) -> bool {
+        self.total_sessions > 0 || self.total_messages > 0 || self.totals.total_tokens > 0
+    }
+}
+
 struct TopModelStat {
     label: String,
     share: f64,
@@ -3519,6 +4090,146 @@ fn cost_delta(current: Option<f64>, previous: Option<f64>) -> Option<f64> {
     match (current, previous) {
         (Some(cur), Some(prev)) => Some(cur - prev),
         _ => None,
+    }
+}
+
+fn wrapped_year_bounds(
+    year: i32,
+    now_local: DateTime<Local>,
+) -> (NaiveDate, NaiveDate, DateTime<Utc>, DateTime<Utc>) {
+    let start_date = NaiveDate::from_ymd_opt(year, 1, 1).unwrap_or(now_local.date_naive());
+    let last_day = NaiveDate::from_ymd_opt(year, 12, 31).unwrap_or(start_date);
+    let end_date = if year == now_local.year() {
+        now_local.date_naive().min(last_day)
+    } else {
+        last_day
+    };
+    let start = local_start_of_day(start_date);
+    let end_exclusive = end_date
+        .checked_add_signed(ChronoDuration::days(1))
+        .unwrap_or(end_date);
+    let end = local_start_of_day(end_exclusive);
+    (start_date, end_date, start, end)
+}
+
+fn streak_stats_for_year(
+    daily_tokens: &HashMap<NaiveDate, u64>,
+    end_date: NaiveDate,
+) -> (u64, u64, HashSet<NaiveDate>) {
+    if daily_tokens.is_empty() {
+        return (0, 0, HashSet::new());
+    }
+    let mut days: Vec<NaiveDate> = daily_tokens.keys().copied().collect();
+    days.sort();
+
+    let mut max_streak = 1u64;
+    let mut max_start = 0usize;
+    let mut max_end = 0usize;
+    let mut temp_start = 0usize;
+    let mut temp_len = 1u64;
+
+    for i in 1..days.len() {
+        let prev = days[i - 1];
+        let current = days[i];
+        if current == prev + ChronoDuration::days(1) {
+            temp_len += 1;
+            if temp_len > max_streak {
+                max_streak = temp_len;
+                max_start = temp_start;
+                max_end = i;
+            }
+        } else {
+            temp_start = i;
+            temp_len = 1;
+        }
+    }
+
+    let max_streak_days: HashSet<NaiveDate> = days[max_start..=max_end].iter().copied().collect();
+
+    let active_days: HashSet<NaiveDate> = daily_tokens.keys().copied().collect();
+    let today = end_date;
+    let yesterday = today - ChronoDuration::days(1);
+    let current_anchor = if active_days.contains(&today) {
+        Some(today)
+    } else if active_days.contains(&yesterday) {
+        Some(yesterday)
+    } else {
+        None
+    };
+
+    let current_streak = if let Some(mut cursor) = current_anchor {
+        let mut streak = 0u64;
+        loop {
+            if active_days.contains(&cursor) {
+                streak += 1;
+                cursor = cursor - ChronoDuration::days(1);
+            } else {
+                break;
+            }
+        }
+        streak
+    } else {
+        0
+    };
+
+    (max_streak, current_streak, max_streak_days)
+}
+
+fn heatmap_weeks_for_year(year: i32, end_date: NaiveDate) -> Vec<[Option<NaiveDate>; 7]> {
+    let start_date = NaiveDate::from_ymd_opt(year, 1, 1).unwrap_or(end_date);
+    let start_offset = start_date.weekday().num_days_from_monday() as i64;
+    let mut cursor = start_date
+        .checked_sub_signed(ChronoDuration::days(start_offset))
+        .unwrap_or(start_date);
+    let mut weeks = Vec::new();
+    let mut week = [None; 7];
+
+    loop {
+        let weekday_idx = cursor.weekday().num_days_from_monday() as usize;
+        if cursor.year() == year && cursor <= end_date {
+            week[weekday_idx] = Some(cursor);
+        }
+        if weekday_idx == 6 {
+            if week.iter().any(|day| day.is_some()) {
+                weeks.push(week);
+            }
+            week = [None; 7];
+            if cursor >= end_date {
+                break;
+            }
+        }
+        cursor = cursor
+            .checked_add_signed(ChronoDuration::days(1))
+            .unwrap_or(cursor);
+        if cursor.year() > year + 1 {
+            break;
+        }
+    }
+
+    if week.iter().any(|day| day.is_some()) {
+        weeks.push(week);
+    }
+
+    weeks
+}
+
+fn heatmap_intensity(count: u64, max: u64) -> usize {
+    if count == 0 || max == 0 {
+        return 0;
+    }
+    let ratio = count as f64 / max as f64;
+    if ratio <= 0.1 {
+        1
+    } else if ratio <= 0.25 {
+        2
+    } else if ratio <= 0.4 {
+        3
+    } else if ratio <= 0.6 {
+        4
+    } else if ratio <= 0.8 {
+        5
+    } else {
+        6
     }
 }
 
@@ -3728,16 +4439,33 @@ impl ListState {
     }
 }
 
-struct RecentSessionViewState {
+struct SessionsViewState {
+    nav: TimeNavState,
     list: ListState,
+    sort: SessionSort,
     initialized: bool,
 }
 
-impl RecentSessionViewState {
+impl SessionsViewState {
     fn new() -> Self {
+        let today = Local::now().date_naive();
         Self {
+            nav: TimeNavState::new(TimeRange::Day, today),
             list: ListState::new(),
+            sort: SessionSort::Recent,
             initialized: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.list.reset();
+        self.initialized = false;
+    }
+
+    fn set_sort(&mut self, sort: SessionSort) {
+        if self.sort != sort {
+            self.sort = sort;
+            self.reset();
         }
     }
 
@@ -3778,45 +4506,6 @@ impl RecentSessionViewState {
     ) -> Option<&'a SessionAggregate> {
         let idx = self.list.selected_row.checked_sub(offset)?;
         sessions.get(idx)
-    }
-}
-
-struct TopSpendingViewState {
-    nav: TimeNavState,
-    list: ListState,
-}
-
-impl TopSpendingViewState {
-    fn new() -> Self {
-        let today = Local::now().date_naive();
-        Self {
-            nav: TimeNavState::new(TimeRange::Day, today),
-            list: ListState::new(),
-        }
-    }
-
-    fn sync_with(&mut self, rows: usize) {
-        self.list.clamp(rows);
-    }
-
-    fn move_selection_up(&mut self, rows: usize) {
-        self.list.move_selection_up(rows);
-    }
-
-    fn move_selection_down(&mut self, rows: usize) {
-        self.list.move_selection_down(rows);
-    }
-
-    fn page_up(&mut self, rows: usize) {
-        self.list.page_up(rows);
-    }
-
-    fn page_down(&mut self, rows: usize) {
-        self.list.page_down(rows);
-    }
-
-    fn selected<'a>(&self, rows: &'a [SessionAggregate]) -> Option<&'a SessionAggregate> {
-        rows.get(self.list.selected_row)
     }
 }
 
@@ -4109,6 +4798,24 @@ impl StatsViewState {
     }
 }
 
+struct WrappedViewState {
+    year: i32,
+}
+
+impl WrappedViewState {
+    fn new(today: NaiveDate) -> Self {
+        Self { year: today.year() }
+    }
+
+    fn prev_year(&mut self) {
+        self.year = self.year.saturating_sub(1);
+    }
+
+    fn next_year(&mut self) {
+        self.year = self.year.saturating_add(1);
+    }
+}
+
 struct MissingPriceModalState {
     open: bool,
     selected: usize,
@@ -4313,11 +5020,6 @@ fn session_detail_rows(
         detail_row(
             "Last Result",
             format_detail_snippet(aggregate.last_summary.as_ref()),
-            theme,
-        ),
-        detail_row(
-            "Messages",
-            format_count_short(aggregate.user_messages),
             theme,
         ),
         detail_row_spans("CWD", cwd_spans, theme),

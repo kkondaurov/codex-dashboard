@@ -1313,6 +1313,145 @@ impl Storage {
         })
     }
 
+    pub async fn token_totals_by_day(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<DailyTokenTotal>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                strftime('%Y-%m-%d', timestamp, 'localtime') AS day,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens
+            FROM session_turns
+            WHERE timestamp >= ? AND timestamp < ?
+            GROUP BY day
+            ORDER BY day ASC
+            "#,
+        )
+        .bind(start.to_rfc3339())
+        .bind(end.to_rfc3339())
+        .fetch_all(&*self.pool)
+        .await
+        .with_context(|| "failed to load token totals by day")?;
+
+        let mut totals = Vec::with_capacity(rows.len());
+        for row in rows {
+            let day_str: String = row.try_get("day")?;
+            let date = NaiveDate::parse_from_str(&day_str, "%Y-%m-%d")
+                .with_context(|| format!("invalid day in token totals: {day_str}"))?;
+            totals.push(DailyTokenTotal {
+                date,
+                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+            });
+        }
+        Ok(totals)
+    }
+
+    pub async fn model_usage_by_tokens(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<ModelTokenTotal>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT model, COALESCE(SUM(total_tokens), 0) AS total_tokens
+            FROM session_turns
+            WHERE timestamp >= ? AND timestamp < ?
+            GROUP BY model
+            ORDER BY total_tokens DESC, model ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(start.to_rfc3339())
+        .bind(end.to_rfc3339())
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&*self.pool)
+        .await
+        .with_context(|| "failed to load model usage totals")?;
+
+        let mut totals = Vec::with_capacity(rows.len());
+        for row in rows {
+            totals.push(ModelTokenTotal {
+                model: row.try_get::<String, _>("model")?,
+                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+            });
+        }
+        Ok(totals)
+    }
+
+    pub async fn project_count_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<u64> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(DISTINCT project) AS project_count
+            FROM (
+                SELECT COALESCE(NULLIF(repo_url, ''), NULLIF(cwd, '')) AS project
+                FROM sessions
+                WHERE session_id IN (
+                    SELECT DISTINCT session_id
+                    FROM session_turns
+                    WHERE timestamp >= ?1 AND timestamp < ?2
+                )
+            )
+            WHERE project IS NOT NULL
+            "#,
+        )
+        .bind(start.to_rfc3339())
+        .bind(end.to_rfc3339())
+        .fetch_one(&*self.pool)
+        .await
+        .with_context(|| "failed to load project count")?;
+
+        Ok(row.try_get::<i64, _>("project_count").unwrap_or(0) as u64)
+    }
+
+    pub async fn first_session_timestamp(&self) -> Result<Option<DateTime<Utc>>> {
+        let row = sqlx::query(
+            r#"
+            SELECT MIN(started_at) AS first_ts
+            FROM sessions
+            "#,
+        )
+        .fetch_one(&*self.pool)
+        .await
+        .with_context(|| "failed to load first session timestamp")?;
+
+        let timestamp: Option<String> = row.try_get("first_ts").ok();
+        let Some(value) = timestamp else {
+            return Ok(None);
+        };
+        let parsed = DateTime::parse_from_rfc3339(&value)
+            .map(|dt| dt.with_timezone(&Utc))
+            .with_context(|| "invalid first session timestamp")?;
+        Ok(Some(parsed))
+    }
+
+    pub async fn first_turn_timestamp(&self) -> Result<Option<DateTime<Utc>>> {
+        let row = sqlx::query(
+            r#"
+            SELECT MIN(timestamp) AS first_ts
+            FROM session_turns
+            "#,
+        )
+        .fetch_one(&*self.pool)
+        .await
+        .with_context(|| "failed to load first turn timestamp")?;
+
+        let timestamp: Option<String> = row.try_get("first_ts").ok();
+        let Some(value) = timestamp else {
+            return Ok(None);
+        };
+        let parsed = DateTime::parse_from_rfc3339(&value)
+            .map(|dt| dt.with_timezone(&Utc))
+            .with_context(|| "invalid first turn timestamp")?;
+        Ok(Some(parsed))
+    }
+
     pub async fn aggregates_by_bucket(
         &self,
         start: DateTime<Utc>,
@@ -1426,23 +1565,32 @@ impl Storage {
 
     // price_by_id removed - pricing is read-only from remote source
 
-    pub async fn recent_sessions_count(&self) -> Result<usize> {
+    pub async fn sessions_count_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<usize> {
         let row = sqlx::query(
             r#"
-            SELECT COUNT(*) AS total
-            FROM sessions
+            SELECT COUNT(DISTINCT session_id) AS total
+            FROM session_turn_costs
+            WHERE timestamp BETWEEN ?1 AND ?2
             "#,
         )
+        .bind(start.to_rfc3339())
+        .bind(end.to_rfc3339())
         .fetch_one(&*self.pool)
         .await
-        .with_context(|| "failed to count sessions")?;
+        .with_context(|| "failed to count sessions in range")?;
 
         let total = row.try_get::<i64, _>("total").unwrap_or(0);
         Ok(total.max(0) as usize)
     }
 
-    pub async fn recent_sessions_page(
+    pub async fn sessions_page_by_recent_between(
         &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
         offset: usize,
         limit: usize,
     ) -> Result<Vec<SessionAggregate>> {
@@ -1452,103 +1600,67 @@ impl Storage {
 
         let rows = sqlx::query(
             r#"
-            WITH recent AS (
-                SELECT
-                    session_id,
-                    last_event_at,
-                    last_model,
-                    cwd,
-                    repo_url,
-                    repo_branch,
-                    subagent,
-                    prompt_tokens,
-                    cached_prompt_tokens,
-                    completion_tokens,
-                    total_tokens,
-                    reasoning_tokens,
-                    user_messages,
-                    title,
-                    last_summary
-                FROM sessions
-                ORDER BY last_event_at DESC
-                LIMIT ?1 OFFSET ?2
+            WITH period_sessions AS (
+                SELECT session_id, MAX(timestamp) AS last_in_range
+                FROM session_turn_costs
+                WHERE timestamp BETWEEN ?1 AND ?2
+                GROUP BY session_id
             ),
             session_costs AS (
                 SELECT
-                    d.session_id,
+                    session_id,
                     COALESCE(SUM(cost_usd), 0.0) AS cost_usd,
                     COALESCE(SUM(missing_price), 0) AS missing_price
-                FROM session_daily_costs d
-                JOIN recent r ON r.session_id = d.session_id
-                GROUP BY d.session_id
+                FROM session_daily_costs
+                GROUP BY session_id
             )
             SELECT
-                r.session_id,
-                r.last_event_at,
-                r.last_model,
-                r.cwd,
-                r.repo_url,
-                r.repo_branch,
-                r.subagent,
-                r.prompt_tokens,
-                r.cached_prompt_tokens,
-                r.completion_tokens,
-                r.total_tokens,
-                r.reasoning_tokens,
-                r.user_messages,
-                r.title,
-                r.last_summary,
+                s.session_id,
+                s.last_event_at,
+                s.last_model,
+                s.cwd,
+                s.repo_url,
+                s.repo_branch,
+                s.subagent,
+                s.prompt_tokens,
+                s.cached_prompt_tokens,
+                s.completion_tokens,
+                s.total_tokens,
+                s.reasoning_tokens,
+                s.user_messages,
+                s.title,
+                s.last_summary,
                 session_costs.cost_usd,
                 session_costs.missing_price
-            FROM recent r
-            LEFT JOIN session_costs ON session_costs.session_id = r.session_id
-            ORDER BY r.last_event_at DESC
+            FROM period_sessions p
+            JOIN sessions s ON s.session_id = p.session_id
+            LEFT JOIN session_costs ON session_costs.session_id = s.session_id
+            ORDER BY p.last_in_range DESC
+            LIMIT ?3 OFFSET ?4
             "#,
         )
+        .bind(start.to_rfc3339())
+        .bind(end.to_rfc3339())
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .bind(i64::try_from(offset).unwrap_or(0))
         .fetch_all(&*self.pool)
         .await
-        .with_context(|| "failed to load recent sessions page")?;
+        .with_context(|| "failed to load sessions by recent")?;
 
-        let mut aggregates = Vec::with_capacity(rows.len());
-        for row in rows {
-            let last_activity_str: String = row.try_get("last_event_at")?;
-            let last_activity = DateTime::parse_from_rfc3339(&last_activity_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .with_context(|| "invalid last_event_at timestamp in sessions")?;
-            aggregates.push(SessionAggregate {
-                session_id: row.try_get::<String, _>("session_id")?,
-                last_activity,
-                last_model: row
-                    .try_get::<String, _>("last_model")
-                    .unwrap_or_else(|_| "unknown".to_string()),
-                cwd: row.try_get::<Option<String>, _>("cwd")?,
-                repo_url: row.try_get::<Option<String>, _>("repo_url")?,
-                repo_branch: row.try_get::<Option<String>, _>("repo_branch")?,
-                subagent: row.try_get::<Option<String>, _>("subagent")?,
-                prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
-                cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0)
-                    as u64,
-                completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
-                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
-                reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
-                user_messages: row.try_get::<i64, _>("user_messages").unwrap_or(0) as u64,
-                cost_usd: cost_from_row(&row),
-                title: row.try_get::<Option<String>, _>("title")?,
-                last_summary: row.try_get::<Option<String>, _>("last_summary")?,
-            });
-        }
-
-        Ok(aggregates)
+        Ok(session_aggregates_from_rows(rows)?)
     }
 
-    pub async fn top_sessions_between(
+    pub async fn sessions_page_by_cost_between(
         &self,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
+        offset: usize,
         limit: usize,
     ) -> Result<Vec<SessionAggregate>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
         let rows = sqlx::query(
             r#"
             WITH period_stats AS (
@@ -1594,46 +1706,18 @@ impl Storage {
             LEFT JOIN session_costs ON session_costs.session_id = s.session_id
             ORDER BY COALESCE(period_stats.period_cost, 0) DESC,
                      COALESCE(period_stats.period_prompt, 0) DESC
-            LIMIT ?3
+            LIMIT ?3 OFFSET ?4
             "#,
         )
         .bind(start.to_rfc3339())
         .bind(end.to_rfc3339())
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .bind(i64::try_from(offset).unwrap_or(0))
         .fetch_all(&*self.pool)
         .await
-        .with_context(|| "failed to load top sessions")?;
+        .with_context(|| "failed to load sessions by cost")?;
 
-        let mut aggregates = Vec::with_capacity(rows.len());
-        for row in rows {
-            let last_activity_str: String = row.try_get("last_event_at")?;
-            let last_activity = DateTime::parse_from_rfc3339(&last_activity_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .with_context(|| "invalid last_event_at timestamp in sessions")?;
-            aggregates.push(SessionAggregate {
-                session_id: row.try_get::<String, _>("session_id")?,
-                last_activity,
-                last_model: row
-                    .try_get::<String, _>("last_model")
-                    .unwrap_or_else(|_| "unknown".to_string()),
-                cwd: row.try_get::<Option<String>, _>("cwd")?,
-                repo_url: row.try_get::<Option<String>, _>("repo_url")?,
-                repo_branch: row.try_get::<Option<String>, _>("repo_branch")?,
-                subagent: row.try_get::<Option<String>, _>("subagent")?,
-                prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
-                cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0)
-                    as u64,
-                completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
-                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
-                reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
-                user_messages: row.try_get::<i64, _>("user_messages").unwrap_or(0) as u64,
-                cost_usd: cost_from_row(&row),
-                title: row.try_get::<Option<String>, _>("title")?,
-                last_summary: row.try_get::<Option<String>, _>("last_summary")?,
-            });
-        }
-
-        Ok(aggregates)
+        Ok(session_aggregates_from_rows(rows)?)
     }
 
     pub async fn session_turns_for_message(
@@ -2511,6 +2595,18 @@ pub struct PeriodCounts {
 }
 
 #[derive(Debug, Clone)]
+pub struct DailyTokenTotal {
+    pub date: NaiveDate,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelTokenTotal {
+    pub model: String,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct TopModelShare {
     pub model: String,
     pub reasoning_effort: Option<String>,
@@ -2588,6 +2684,38 @@ fn map_session_turn_rows(rows: Vec<SqliteRow>, label: &str) -> Result<Vec<Sessio
     }
 
     Ok(turns)
+}
+
+fn session_aggregates_from_rows(rows: Vec<SqliteRow>) -> Result<Vec<SessionAggregate>> {
+    let mut aggregates = Vec::with_capacity(rows.len());
+    for row in rows {
+        let last_activity_str: String = row.try_get("last_event_at")?;
+        let last_activity = DateTime::parse_from_rfc3339(&last_activity_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .with_context(|| "invalid last_event_at timestamp in sessions")?;
+        aggregates.push(SessionAggregate {
+            session_id: row.try_get::<String, _>("session_id")?,
+            last_activity,
+            last_model: row
+                .try_get::<String, _>("last_model")
+                .unwrap_or_else(|_| "unknown".to_string()),
+            cwd: row.try_get::<Option<String>, _>("cwd")?,
+            repo_url: row.try_get::<Option<String>, _>("repo_url")?,
+            repo_branch: row.try_get::<Option<String>, _>("repo_branch")?,
+            subagent: row.try_get::<Option<String>, _>("subagent")?,
+            prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+            cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0) as u64,
+            completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
+            total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+            reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
+            user_messages: row.try_get::<i64, _>("user_messages").unwrap_or(0) as u64,
+            cost_usd: cost_from_row(&row),
+            title: row.try_get::<Option<String>, _>("title")?,
+            last_summary: row.try_get::<Option<String>, _>("last_summary")?,
+        });
+    }
+
+    Ok(aggregates)
 }
 
 fn cost_from_row(row: &SqliteRow) -> Option<f64> {
@@ -2678,7 +2806,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn top_sessions_between_orders_by_period_cost() {
+    async fn sessions_by_cost_orders_by_period_cost() {
         let db_file = NamedTempFile::new().unwrap();
         let storage = Storage::connect(db_file.path()).await.unwrap();
         storage.ensure_schema().await.unwrap();
@@ -2723,7 +2851,7 @@ mod tests {
             .unwrap();
 
         let rows = storage
-            .top_sessions_between(base - ChronoDuration::hours(1), base, 10)
+            .sessions_page_by_cost_between(base - ChronoDuration::hours(1), base, 0, 10)
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
