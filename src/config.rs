@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub storage: StorageConfig,
@@ -19,18 +19,6 @@ pub struct AppConfig {
     pub pricing: PricingConfig,
     #[serde(default)]
     pub alerts: AlertConfig,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            storage: StorageConfig::default(),
-            display: DisplayConfig::default(),
-            sessions: SessionsConfig::default(),
-            pricing: PricingConfig::default(),
-            alerts: AlertConfig::default(),
-        }
-    }
 }
 
 impl AppConfig {
@@ -65,10 +53,10 @@ impl AppConfig {
         if let Ok(sessions_dir) = env::var("CODEX_USAGE_SESSIONS_DIR") {
             self.sessions.root_dir = PathBuf::from(sessions_dir);
         }
-        if let Ok(poll_interval) = env::var("CODEX_USAGE_SESSIONS_POLL_INTERVAL_SECS") {
-            if let Ok(value) = poll_interval.parse::<u64>() {
-                self.sessions.poll_interval_secs = value;
-            }
+        if let Ok(poll_interval) = env::var("CODEX_USAGE_SESSIONS_POLL_INTERVAL_SECS")
+            && let Ok(value) = poll_interval.parse::<u64>()
+        {
+            self.sessions.poll_interval_secs = value;
         }
     }
 }
@@ -163,21 +151,12 @@ impl Default for RemotePricingConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct AlertConfig {
     #[serde(default)]
     pub daily_budget_usd: Option<f64>,
     #[serde(default)]
     pub monthly_budget_usd: Option<f64>,
-}
-
-impl Default for AlertConfig {
-    fn default() -> Self {
-        Self {
-            daily_budget_usd: None,
-            monthly_budget_usd: None,
-        }
-    }
 }
 
 fn default_database_path() -> PathBuf {

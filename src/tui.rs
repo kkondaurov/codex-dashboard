@@ -3,7 +3,7 @@ use crate::{
     pricing_remote,
     storage::{
         AggregateTotals, MissingPriceDetail, ModelUsageRow, PriceRow, PricingMeta,
-        SessionAggregate, SessionTurn, Storage, ToolCountRow, TopModelShare,
+        SessionAggregate, SessionMessage, SessionTurn, Storage, ToolCountRow, TopModelShare,
     },
 };
 use anyhow::Result;
@@ -35,16 +35,22 @@ use std::{
 use tokio::runtime::Handle;
 
 const TURN_VIEW_LIMIT: usize = 500;
+const MESSAGE_VIEW_LIMIT: usize = 400;
 const LIST_TITLE_MAX_CHARS: usize = 200;
-const MODEL_NAME_MAX_CHARS: usize = 18;
 const CWD_MAX_CHARS: usize = 22;
 const BRANCH_MAX_CHARS: usize = 21;
+const MODAL_TIME_COL_WIDTH: u16 = 10;
+const MODAL_INFO_COL_WIDTH: u16 = 22;
+const MODAL_COST_COL_WIDTH: u16 = 10;
+const MODAL_TOKEN_COL_WIDTH: u16 = 7;
+const MODAL_REASON_COL_WIDTH: u16 = 9;
+const MODAL_CONTEXT_COL_WIDTH: u16 = 11;
 const SUMMARY_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const RECENT_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const TOP_SPENDING_REFRESH_INTERVAL: Duration = Duration::from_millis(2000);
 const STATS_REFRESH_INTERVAL: Duration = Duration::from_millis(3000);
 const PRICING_REFRESH_INTERVAL: Duration = Duration::from_millis(8000);
-const MODAL_TURNS_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
+const MODAL_MESSAGES_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum ViewMode {
@@ -184,12 +190,16 @@ struct UiDataCache {
     last_ingest: Option<DateTime<Utc>>,
     ingest_last: Option<Instant>,
     ingest_flash: Option<Instant>,
-    modal_turns: Vec<SessionTurn>,
+    modal_messages: Vec<SessionMessage>,
+    modal_message_total: usize,
+    modal_unattributed: Option<SessionMessage>,
+    modal_turns_by_message: HashMap<MessageGroupKey, Vec<SessionTurn>>,
     modal_turn_total: usize,
     modal_daily_totals: HashMap<NaiveDate, AggregateTotals>,
     modal_turn_totals: Option<AggregateTotals>,
     modal_model_mix: Vec<ModelUsageRow>,
     modal_tool_counts: Vec<ToolCountRow>,
+    modal_ingest_at: Option<DateTime<Utc>>,
     modal_key: Option<String>,
     modal_last: Option<Instant>,
 }
@@ -218,12 +228,16 @@ impl UiDataCache {
             last_ingest: None,
             ingest_last: None,
             ingest_flash: None,
-            modal_turns: Vec::new(),
+            modal_messages: Vec::new(),
+            modal_message_total: 0,
+            modal_unattributed: None,
+            modal_turns_by_message: HashMap::new(),
             modal_turn_total: 0,
             modal_daily_totals: HashMap::new(),
             modal_turn_totals: None,
             modal_model_mix: Vec::new(),
             modal_tool_counts: Vec::new(),
+            modal_ingest_at: None,
             modal_key: None,
             modal_last: None,
         }
@@ -252,6 +266,7 @@ impl UiDataCache {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn refresh_overview(
         &mut self,
         now: Instant,
@@ -403,20 +418,26 @@ impl UiDataCache {
         }
     }
 
-    fn refresh_modal_turns(
+    fn refresh_modal_messages(
         &mut self,
         now: Instant,
         runtime: &Handle,
         storage: &Storage,
         selected: Option<&SessionAggregate>,
+        expanded: Option<MessageGroupKey>,
+        last_ingest: Option<DateTime<Utc>>,
     ) {
         let Some(selected) = selected else {
-            self.modal_turns.clear();
+            self.modal_messages.clear();
+            self.modal_message_total = 0;
+            self.modal_unattributed = None;
+            self.modal_turns_by_message.clear();
             self.modal_turn_total = 0;
             self.modal_daily_totals.clear();
             self.modal_turn_totals = None;
             self.modal_model_mix.clear();
             self.modal_tool_counts.clear();
+            self.modal_ingest_at = last_ingest;
             self.modal_key = None;
             self.modal_last = None;
             return;
@@ -426,18 +447,36 @@ impl UiDataCache {
         if self.modal_key.as_deref() != Some(key.as_str()) {
             self.modal_key = Some(key);
             self.modal_last = None;
-            self.modal_turns.clear();
+            self.modal_messages.clear();
+            self.modal_message_total = 0;
+            self.modal_unattributed = None;
+            self.modal_turns_by_message.clear();
             self.modal_turn_total = 0;
             self.modal_daily_totals.clear();
             self.modal_turn_totals = None;
+            self.modal_ingest_at = last_ingest;
         }
 
-        if Self::should_refresh(self.modal_last, MODAL_TURNS_REFRESH_INTERVAL, now) {
+        let ingest_changed = last_ingest.is_some() && self.modal_ingest_at != last_ingest;
+        let refresh_due = self.modal_last.is_none()
+            || (ingest_changed
+                && Self::should_refresh(self.modal_last, MODAL_MESSAGES_REFRESH_INTERVAL, now));
+        if refresh_due {
+            match runtime.block_on(
+                storage.session_messages(selected.session_id.as_str(), MESSAGE_VIEW_LIMIT),
+            ) {
+                Ok(messages) => self.modal_messages = messages,
+                Err(err) => tracing::warn!(error = %err, "failed to load session messages"),
+            }
+            match runtime.block_on(storage.session_messages_count(selected.session_id.as_str())) {
+                Ok(total) => self.modal_message_total = total,
+                Err(err) => tracing::warn!(error = %err, "failed to count session messages"),
+            }
             match runtime
-                .block_on(storage.session_turns(selected.session_id.as_str(), TURN_VIEW_LIMIT))
+                .block_on(storage.session_unattributed_message(selected.session_id.as_str()))
             {
-                Ok(turns) => self.modal_turns = turns,
-                Err(err) => tracing::warn!(error = %err, "failed to load session turns"),
+                Ok(summary) => self.modal_unattributed = summary,
+                Err(err) => tracing::warn!(error = %err, "failed to load unattributed summary"),
             }
             match runtime.block_on(storage.session_turns_count(selected.session_id.as_str())) {
                 Ok(total) => self.modal_turn_total = total,
@@ -463,7 +502,38 @@ impl UiDataCache {
                 Ok(rows) => self.modal_tool_counts = rows,
                 Err(err) => tracing::warn!(error = %err, "failed to load session tool counts"),
             }
+            if ingest_changed && let Some(key) = expanded {
+                self.modal_turns_by_message.remove(&key);
+            }
             self.modal_last = Some(now);
+            self.modal_ingest_at = last_ingest;
+        }
+
+        if let Some(key) = expanded {
+            if matches!(key, MessageGroupKey::Unattributed) && self.modal_unattributed.is_none() {
+                self.modal_turns_by_message.remove(&key);
+            } else if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.modal_turns_by_message.entry(key)
+            {
+                let message_id = match key {
+                    MessageGroupKey::Message(id) => Some(id),
+                    MessageGroupKey::Unattributed => None,
+                };
+                match runtime.block_on(storage.session_turns_for_message(
+                    selected.session_id.as_str(),
+                    message_id,
+                    TURN_VIEW_LIMIT,
+                )) {
+                    Ok(turns) => {
+                        entry.insert(turns);
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to load message turns");
+                    }
+                }
+            }
+        } else if !self.modal_turns_by_message.is_empty() {
+            self.modal_turns_by_message.clear();
         }
     }
 }
@@ -501,34 +571,38 @@ fn run_blocking(
             let today = now_local.date_naive();
             let mut should_quit = false;
 
-            if event::poll(tick_rate)? {
-                if let Event::Key(key) = event::read()? {
-                    should_quit = handle_key_event(
-                        key,
-                        &mut view_mode,
-                        &mut overview_view,
-                        &mut top_spending_view,
-                        &mut stats_view,
-                        &mut pricing_view,
-                        &mut session_modal,
-                        &mut missing_modal,
-                        &mut help_modal,
-                        &cache.recent_sessions,
-                        cache.recent_total,
-                        cache.recent_offset,
-                        &cache.top_spending_rows,
-                        cache.modal_turns.len(),
-                        cache.modal_turn_total,
-                        &cache.modal_model_mix,
-                        &cache.modal_tool_counts,
-                        &cache.pricing_rows,
-                        &cache.pricing_missing,
-                        &runtime,
-                        &storage,
-                        today,
-                        &config.pricing,
-                    );
-                }
+            if event::poll(tick_rate)?
+                && let Event::Key(key) = event::read()?
+            {
+                should_quit = handle_key_event(
+                    key,
+                    &mut view_mode,
+                    &mut overview_view,
+                    &mut top_spending_view,
+                    &mut stats_view,
+                    &mut pricing_view,
+                    &mut session_modal,
+                    &mut missing_modal,
+                    &mut help_modal,
+                    &cache.recent_sessions,
+                    cache.recent_total,
+                    cache.recent_offset,
+                    &cache.top_spending_rows,
+                    &cache.modal_messages,
+                    cache.modal_unattributed.as_ref(),
+                    &cache.modal_turns_by_message,
+                    &cache.modal_daily_totals,
+                    cache.modal_turn_totals.as_ref(),
+                    cache.modal_turn_total,
+                    &cache.modal_model_mix,
+                    &cache.modal_tool_counts,
+                    &cache.pricing_rows,
+                    &cache.pricing_missing,
+                    &runtime,
+                    &storage,
+                    today,
+                    &config.pricing,
+                );
             }
 
             while !should_quit && event::poll(Duration::from_millis(0))? {
@@ -547,7 +621,11 @@ fn run_blocking(
                         cache.recent_total,
                         cache.recent_offset,
                         &cache.top_spending_rows,
-                        cache.modal_turns.len(),
+                        &cache.modal_messages,
+                        cache.modal_unattributed.as_ref(),
+                        &cache.modal_turns_by_message,
+                        &cache.modal_daily_totals,
+                        cache.modal_turn_totals.as_ref(),
                         cache.modal_turn_total,
                         &cache.modal_model_mix,
                         &cache.modal_tool_counts,
@@ -629,9 +707,23 @@ fn run_blocking(
             }
 
             if session_modal.is_open() {
-                cache.refresh_modal_turns(now, &runtime, &storage, selected_session.as_ref());
+                cache.refresh_modal_messages(
+                    now,
+                    &runtime,
+                    &storage,
+                    selected_session.as_ref(),
+                    session_modal.expanded_key(),
+                    cache.last_ingest,
+                );
             } else {
-                cache.refresh_modal_turns(now, &runtime, &storage, None);
+                cache.refresh_modal_messages(
+                    now,
+                    &runtime,
+                    &storage,
+                    None,
+                    None,
+                    cache.last_ingest,
+                );
             }
 
             let stats_data = if matches!(view_mode, ViewMode::Stats) {
@@ -665,7 +757,10 @@ fn run_blocking(
                     &missing_modal,
                     &help_modal,
                     selected_session.as_ref(),
-                    &cache.modal_turns,
+                    &cache.modal_messages,
+                    cache.modal_message_total,
+                    cache.modal_unattributed.as_ref(),
+                    &cache.modal_turns_by_message,
                     cache.modal_turn_total,
                     &cache.modal_model_mix,
                     &cache.modal_tool_counts,
@@ -708,6 +803,7 @@ fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) -> Result<
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_ui(
     frame: &mut Frame,
     config: &AppConfig,
@@ -723,7 +819,10 @@ fn draw_ui(
     missing_modal: &MissingPriceModalState,
     help_modal: &HelpModalState,
     selected: Option<&SessionAggregate>,
-    turns: &[SessionTurn],
+    messages: &[SessionMessage],
+    message_total: usize,
+    unattributed: Option<&SessionMessage>,
+    turns_by_message: &HashMap<MessageGroupKey, Vec<SessionTurn>>,
     turn_total: usize,
     model_mix: &[ModelUsageRow],
     tool_counts: &[ToolCountRow],
@@ -793,7 +892,10 @@ fn draw_ui(
         render_session_modal(
             frame,
             selected,
-            turns,
+            messages,
+            message_total,
+            unattributed,
+            turns_by_message,
             turn_total,
             &cache.modal_daily_totals,
             cache.modal_turn_totals.as_ref(),
@@ -812,6 +914,7 @@ fn draw_ui(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_overview(
     frame: &mut Frame,
     area: Rect,
@@ -1075,7 +1178,7 @@ fn draw_pricing_view(
     let table = Table::new(rows, widths)
         .header(header)
         .block(gray_block(
-            &format!("Pricing — {total} models • page {page}/{pages} (R refresh; ↑/↓ PgUp/PgDn)"),
+            format!("Pricing — {total} models • page {page}/{pages} (R refresh; ↑/↓ PgUp/PgDn)"),
             &theme,
         ))
         .column_spacing(1)
@@ -1184,7 +1287,7 @@ fn render_missing_prices_modal(
             let last = entry.last_seen.format("%Y-%m-%d").to_string();
             let line = Line::from(vec![
                 Span::styled(
-                    format!("{model}"),
+                    model,
                     if idx == modal.selected {
                         Style::default()
                             .fg(Color::Yellow)
@@ -1240,7 +1343,7 @@ fn render_help_modal(frame: &mut Frame, view_mode: ViewMode) {
         Line::from("  q            quit"),
         Line::from(""),
         Line::from("Actions"),
-        Line::from("  Enter        open details"),
+        Line::from("  Enter        open details / expand message"),
         Line::from("  y            copy (in modal)"),
         Line::from("  !            missing price details"),
         Line::from("  r            refresh pricing (pricing view)"),
@@ -1282,23 +1385,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 fn visible_rows_for_table(area: Rect) -> usize {
     area.height.saturating_sub(3) as usize
-}
-
-fn page_info_for_scroll(
-    scroll_offset: usize,
-    visible_rows: usize,
-    total_rows: usize,
-) -> (usize, usize) {
-    if total_rows == 0 || visible_rows == 0 {
-        return (1, 1);
-    }
-    let pages = (total_rows + visible_rows - 1) / visible_rows;
-    let page = if scroll_offset + visible_rows >= total_rows {
-        pages
-    } else {
-        (scroll_offset / visible_rows) + 1
-    };
-    (page, pages.max(1))
 }
 
 fn recent_window_for(
@@ -1380,25 +1466,9 @@ fn layout_mode(area: Rect) -> LayoutMode {
 fn session_list_widths(area: Rect, mode: LayoutMode) -> Vec<Constraint> {
     match mode {
         LayoutMode::Compact => {
-            let spacing = 6u16;
-            let total = area.width.saturating_sub(spacing) as i32;
-            let fixed = [13, 9, 28];
-            let fixed_total: i32 = fixed.iter().sum();
-            let mut title_width = total - fixed_total;
-            if title_width < 20 {
-                title_width = 20;
-            }
-            vec![
-                Constraint::Length(fixed[0] as u16),
-                Constraint::Length(fixed[1] as u16),
-                Constraint::Length(fixed[2] as u16),
-                Constraint::Length(title_width as u16),
-            ]
-        }
-        LayoutMode::Wide => {
             let spacing = 8u16;
             let total = area.width.saturating_sub(spacing) as i32;
-            let fixed = [13, 9, 22, 21];
+            let fixed = [13, 9, 6, 28];
             let fixed_total: i32 = fixed.iter().sum();
             let mut title_width = total - fixed_total;
             if title_width < 20 {
@@ -1409,6 +1479,24 @@ fn session_list_widths(area: Rect, mode: LayoutMode) -> Vec<Constraint> {
                 Constraint::Length(fixed[1] as u16),
                 Constraint::Length(fixed[2] as u16),
                 Constraint::Length(fixed[3] as u16),
+                Constraint::Length(title_width as u16),
+            ]
+        }
+        LayoutMode::Wide => {
+            let spacing = 10u16;
+            let total = area.width.saturating_sub(spacing) as i32;
+            let fixed = [13, 9, 6, 22, 21];
+            let fixed_total: i32 = fixed.iter().sum();
+            let mut title_width = total - fixed_total;
+            if title_width < 20 {
+                title_width = 20;
+            }
+            vec![
+                Constraint::Length(fixed[0] as u16),
+                Constraint::Length(fixed[1] as u16),
+                Constraint::Length(fixed[2] as u16),
+                Constraint::Length(fixed[3] as u16),
+                Constraint::Length(fixed[4] as u16),
                 Constraint::Length(title_width as u16),
             ]
         }
@@ -1639,26 +1727,18 @@ fn render_status_bar(
     let quit_text = "q to quit";
     let tab_text = "Tab to cycle screens";
 
-    let mut spans = Vec::new();
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled("●", Style::default().fg(ingest_color)));
-    spans.push(Span::styled(" ", Style::default().fg(Color::DarkGray)));
-    spans.push(Span::styled(
-        ingest_text,
-        Style::default().fg(Color::DarkGray),
-    ));
-    spans.push(Span::styled("  |  ", Style::default().fg(Color::DarkGray)));
-    spans.push(Span::styled(
-        help_text,
-        Style::default().fg(Color::DarkGray),
-    ));
-    spans.push(Span::styled("  |  ", Style::default().fg(Color::DarkGray)));
-    spans.push(Span::styled(
-        quit_text,
-        Style::default().fg(Color::DarkGray),
-    ));
-    spans.push(Span::styled("  |  ", Style::default().fg(Color::DarkGray)));
-    spans.push(Span::styled(tab_text, Style::default().fg(Color::DarkGray)));
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled("●", Style::default().fg(ingest_color)),
+        Span::styled(" ", Style::default().fg(Color::DarkGray)),
+        Span::styled(ingest_text, Style::default().fg(Color::DarkGray)),
+        Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(help_text, Style::default().fg(Color::DarkGray)),
+        Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(quit_text, Style::default().fg(Color::DarkGray)),
+        Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(tab_text, Style::default().fg(Color::DarkGray)),
+    ];
     if missing_count > 0 {
         spans.push(Span::styled("  |  ", Style::default().fg(Color::DarkGray)));
         spans.push(Span::styled(
@@ -1737,11 +1817,18 @@ fn render_hero_card(
     };
 
     let mut metric_spans = vec![Span::raw(" "), cost_span, Span::raw("  "), delta_span];
-    if let (Some(budget), Some(cost)) = (metric.budget, metric.total.cost_usd) {
-        if let Some(bar_spans) = budget_bar_with_percent(cost, budget, 10) {
-            metric_spans.push(Span::raw("  "));
-            metric_spans.extend(bar_spans);
-        }
+    let session_label = format_count_short(metric.session_count);
+    let message_label = format_count_short(metric.message_count);
+    metric_spans.push(Span::raw("  "));
+    metric_spans.push(Span::styled(
+        format!("S {session_label} • M {message_label}"),
+        Style::default().fg(theme.label_fg),
+    ));
+    if let (Some(budget), Some(cost)) = (metric.budget, metric.total.cost_usd)
+        && let Some(bar_spans) = budget_bar_with_percent(cost, budget, 10)
+    {
+        metric_spans.push(Span::raw("  "));
+        metric_spans.extend(bar_spans);
     }
 
     let lines = vec![
@@ -1877,6 +1964,7 @@ fn render_top_spending_table(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_session_list_table(
     frame: &mut Frame,
     area: Rect,
@@ -1891,9 +1979,10 @@ fn render_session_list_table(
     let visible_rows = list.visible_rows;
     let mode = layout_mode(area);
     let cost_width = 9u16;
+    let msg_width = 6u16;
     let header_labels = match mode {
-        LayoutMode::Compact => vec!["Time", "Cost", "Context", "Title"],
-        LayoutMode::Wide => vec!["Time", "Cost", "Project", "Branch", "Title"],
+        LayoutMode::Compact => vec!["Time", "Cost", "Msgs", "Context", "Title"],
+        LayoutMode::Wide => vec!["Time", "Cost", "Msgs", "Project", "Branch", "Title"],
     };
     let header_labels_len = header_labels.len();
     let header = light_blue_header(header_labels, theme);
@@ -1952,10 +2041,12 @@ fn render_session_list_table(
                     cost_style
                 };
 
+                let msg_label = align_right(format_count_short(aggregate.user_messages), msg_width);
                 let mut row = match mode {
                     LayoutMode::Compact => Row::new(vec![
                         Cell::from(time_label),
                         Cell::from(cost_label).style(cost_cell_style),
+                        Cell::from(msg_label),
                         Cell::from(truncate_text(
                             &format_context_label(
                                 aggregate.repo_url.as_deref(),
@@ -1970,6 +2061,7 @@ fn render_session_list_table(
                     LayoutMode::Wide => Row::new(vec![
                         Cell::from(time_label),
                         Cell::from(cost_label).style(cost_cell_style),
+                        Cell::from(msg_label),
                         Cell::from(truncate_text(
                             &format_project_label(
                                 aggregate.repo_url.as_deref(),
@@ -2033,10 +2125,14 @@ fn render_session_metadata(
     frame.render_widget(table, area);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_session_modal(
     frame: &mut Frame,
     selected: Option<&SessionAggregate>,
-    turns: &[SessionTurn],
+    messages: &[SessionMessage],
+    message_total: usize,
+    unattributed: Option<&SessionMessage>,
+    turns_by_message: &HashMap<MessageGroupKey, Vec<SessionTurn>>,
     total_turns: usize,
     daily_totals: &HashMap<NaiveDate, AggregateTotals>,
     summary_totals: Option<&AggregateTotals>,
@@ -2077,47 +2173,155 @@ fn render_session_modal(
     );
     render_session_metadata(frame, layout[0], detail_rows, &theme, title);
 
-    let visible_rows = visible_rows_for_table(layout[1]);
-    modal.set_visible_rows(visible_rows, turns.len());
     let show_summary = daily_totals.len() > 1;
     let summary = if show_summary { summary_totals } else { None };
-    render_session_turns_table(
+    let cache_key = modal_row_cache_key(
+        messages,
+        unattributed,
+        modal.expanded_key(),
+        show_summary,
+        turns_by_message,
+    );
+    if modal.row_cache().is_empty() || modal.row_cache_key() != Some(cache_key) {
+        let rows = build_session_modal_row_descriptors(
+            messages,
+            unattributed,
+            modal.expanded_key(),
+            turns_by_message,
+            show_summary,
+        );
+        modal.set_row_cache(rows, cache_key);
+    }
+    let visible_rows = visible_rows_for_table(layout[1]);
+    modal.set_visible_rows(visible_rows, modal.row_cache().len());
+    modal.ensure_selectable(true);
+
+    render_session_messages_table(
         frame,
         layout[1],
-        turns,
+        modal.row_cache(),
+        messages,
+        unattributed,
+        turns_by_message,
+        message_total,
         total_turns,
-        modal.scroll_offset(),
+        modal,
         &theme,
         daily_totals,
         summary,
     );
 }
 
-fn render_session_turns_table(
+fn build_session_modal_row_descriptors(
+    messages: &[SessionMessage],
+    unattributed: Option<&SessionMessage>,
+    expanded: Option<MessageGroupKey>,
+    turns_by_message: &HashMap<MessageGroupKey, Vec<SessionTurn>>,
+    show_summary: bool,
+) -> Vec<ModalRowDescriptor> {
+    let mut rows = Vec::new();
+    if show_summary {
+        rows.push(ModalRowDescriptor::Summary);
+    }
+
+    let mut last_date: Option<NaiveDate> = None;
+    let push_message_rows = |message: &SessionMessage,
+                             message_index: Option<usize>,
+                             key: MessageGroupKey,
+                             rows: &mut Vec<ModalRowDescriptor>,
+                             last_date: &mut Option<NaiveDate>| {
+        let date = message.timestamp.with_timezone(&Local).date_naive();
+        if last_date.is_none() || *last_date != Some(date) {
+            rows.push(ModalRowDescriptor::Day { date });
+            *last_date = Some(date);
+        }
+
+        let is_expanded = expanded == Some(key);
+        rows.push(ModalRowDescriptor::Message {
+            key,
+            message_index,
+            expanded: is_expanded,
+        });
+
+        if is_expanded {
+            if let Some(turns) = turns_by_message.get(&key) {
+                if turns.is_empty() {
+                    rows.push(ModalRowDescriptor::Placeholder { label: "No turns" });
+                } else {
+                    for idx in 0..turns.len() {
+                        rows.push(ModalRowDescriptor::Turn {
+                            key,
+                            turn_index: idx,
+                        });
+                    }
+                }
+            } else if message.turn_count == 0 {
+                rows.push(ModalRowDescriptor::Placeholder { label: "No turns" });
+            } else {
+                rows.push(ModalRowDescriptor::Placeholder {
+                    label: "Loading…"
+                });
+            }
+        }
+    };
+
+    for (idx, message) in messages.iter().enumerate() {
+        push_message_rows(
+            message,
+            Some(idx),
+            MessageGroupKey::Message(message.id),
+            &mut rows,
+            &mut last_date,
+        );
+    }
+    if let Some(message) = unattributed {
+        push_message_rows(
+            message,
+            None,
+            MessageGroupKey::Unattributed,
+            &mut rows,
+            &mut last_date,
+        );
+    }
+
+    rows
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_session_messages_table(
     frame: &mut Frame,
     area: Rect,
-    turns: &[SessionTurn],
+    rows: &[ModalRowDescriptor],
+    messages: &[SessionMessage],
+    unattributed: Option<&SessionMessage>,
+    turns_by_message: &HashMap<MessageGroupKey, Vec<SessionTurn>>,
+    message_total: usize,
     total_turns: usize,
-    scroll_offset: usize,
+    modal: &SessionModalState,
     theme: &UiTheme,
     daily_totals: &HashMap<NaiveDate, AggregateTotals>,
     summary: Option<&AggregateTotals>,
 ) {
     let note_max = {
-        let spacing = 11u16;
-        let fixed_total =
-            19u16 + 18u16 + 10u16 + 7u16 + 7u16 + 7u16 + 7u16 + 7u16 + 9u16 + 6u16 + 5u16;
+        let spacing = 10u16;
+        let fixed_total = MODAL_TIME_COL_WIDTH
+            + MODAL_INFO_COL_WIDTH
+            + MODAL_COST_COL_WIDTH
+            + MODAL_TOKEN_COL_WIDTH * 5
+            + MODAL_REASON_COL_WIDTH
+            + MODAL_CONTEXT_COL_WIDTH;
         let total = area.width.saturating_sub(spacing);
         let available = total.saturating_sub(fixed_total) as usize;
+        let available = available.saturating_sub(1);
         available.max(24)
     };
+    let info_max = (MODAL_INFO_COL_WIDTH as usize).saturating_sub(1);
 
     let header = light_blue_header(
         vec![
             "Time",
-            "Model",
-            "Eff",
-            "Note",
+            " Turns",
+            " Message",
             "Cost",
             "Input",
             "Cached",
@@ -2131,108 +2335,233 @@ fn render_session_turns_table(
     );
 
     let visible_rows = visible_rows_for_table(area);
-    let (page, pages) = page_info_for_scroll(scroll_offset, visible_rows, turns.len());
-    let rows: Vec<Row> = if turns.is_empty() {
+    let (page, pages) = modal.page_info(rows.len());
+    let selected_style = Style::default()
+        .fg(theme.highlight_fg)
+        .bg(theme.highlight_bg)
+        .add_modifier(Modifier::BOLD);
+
+    let start = modal.scroll_offset().min(rows.len());
+    let end = (start + visible_rows).min(rows.len());
+    let rows: Vec<Row> = if rows.is_empty() {
         vec![Row::new(vec![
-            "–", "No turns", "", "", "", "", "", "", "", "", "", "",
+            "–",
+            "",
+            " No messages",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
         ])]
     } else {
-        let start = scroll_offset.min(turns.len());
-        let end = (start + visible_rows).min(turns.len());
-        let mut rows = Vec::new();
-        let mut last_date: Option<NaiveDate> = None;
-        if start == 0 {
-            if let Some(totals) = summary {
-                rows.push(session_summary_row(totals));
-            }
-        }
-        for turn in &turns[start..end] {
-            let local_time = turn.timestamp.with_timezone(&Local);
-            let date = local_time.date_naive();
-            if last_date.is_none() || last_date != Some(date) {
-                let totals = daily_totals.get(&date);
-                rows.push(session_day_totals_row(date, totals));
-            }
-            last_date = Some(date);
+        let mut rendered = Vec::new();
+        for (offset, descriptor) in rows[start..end].iter().enumerate() {
+            let absolute_idx = start + offset;
+            let mut row = match *descriptor {
+                ModalRowDescriptor::Summary => summary
+                    .map(session_summary_row)
+                    .unwrap_or_else(|| session_placeholder_row("No totals")),
+                ModalRowDescriptor::Day { date } => {
+                    let totals = daily_totals.get(&date);
+                    session_day_totals_row(date, totals)
+                }
+                ModalRowDescriptor::Message {
+                    message_index,
+                    expanded,
+                    ..
+                } => {
+                    let message = match message_index {
+                        Some(idx) => messages.get(idx),
+                        None => unattributed,
+                    };
+                    if let Some(message) = message {
+                        session_message_row(message, expanded, note_max, info_max)
+                    } else {
+                        session_placeholder_row("Missing message")
+                    }
+                }
+                ModalRowDescriptor::Turn { key, turn_index } => turns_by_message
+                    .get(&key)
+                    .and_then(|turns| turns.get(turn_index))
+                    .map(|turn| session_turn_row(turn, note_max, info_max))
+                    .unwrap_or_else(|| session_placeholder_row("Missing turn")),
+                ModalRowDescriptor::Placeholder { label } => session_placeholder_row(label),
+            };
 
-            let result = turn
-                .note
-                .as_ref()
-                .map(|value| truncate_text(value, note_max))
-                .unwrap_or_else(|| "—".to_string());
-            rows.push(Row::new(vec![
-                Cell::from(local_time.format("%H:%M:%S").to_string()),
-                Cell::from(truncate_text(&turn.model, MODEL_NAME_MAX_CHARS)),
-                Cell::from(format_turn_effort(turn.reasoning_effort.as_deref())),
-                Cell::from(result),
-                Cell::from(align_right(
-                    format_turn_cost(turn.usage_included, turn.cost_usd),
-                    10,
-                )),
-                Cell::from(align_right(
-                    format_turn_tokens(turn.usage_included, turn.prompt_tokens),
-                    7,
-                )),
-                Cell::from(align_right(
-                    format_turn_tokens(turn.usage_included, turn.cached_prompt_tokens),
-                    7,
-                )),
-                Cell::from(align_right(
-                    format_turn_tokens(turn.usage_included, turn.blended_total()),
-                    7,
-                )),
-                Cell::from(align_right(
-                    format_turn_tokens(turn.usage_included, turn.completion_tokens),
-                    7,
-                )),
-                Cell::from(align_right(
-                    format_turn_tokens(turn.usage_included, turn.total_tokens),
-                    7,
-                )),
-                Cell::from(align_right(
-                    format_turn_tokens(turn.usage_included, turn.reasoning_tokens),
-                    9,
-                )),
-                Cell::from(Line::from(ctx_gauge_spans(
-                    turn.total_tokens,
-                    turn.context_window,
-                ))),
-            ]));
-            if rows.len() >= visible_rows {
+            if absolute_idx == modal.selected_row() && is_modal_row_selectable(&rows[absolute_idx])
+            {
+                row = row.style(selected_style);
+            }
+            rendered.push(row);
+            if rendered.len() >= visible_rows {
                 break;
             }
         }
-        rows
+        rendered
     };
 
     let widths = [
-        Constraint::Length(9),
-        Constraint::Length(18),
-        Constraint::Length(6),
+        Constraint::Length(MODAL_TIME_COL_WIDTH),
+        Constraint::Length(MODAL_INFO_COL_WIDTH),
         Constraint::Min(24),
-        Constraint::Length(10),
-        Constraint::Length(7),
-        Constraint::Length(7),
-        Constraint::Length(7),
-        Constraint::Length(7),
-        Constraint::Length(7),
-        Constraint::Length(9),
-        Constraint::Length(11),
+        Constraint::Length(MODAL_COST_COL_WIDTH),
+        Constraint::Length(MODAL_TOKEN_COL_WIDTH),
+        Constraint::Length(MODAL_TOKEN_COL_WIDTH),
+        Constraint::Length(MODAL_TOKEN_COL_WIDTH),
+        Constraint::Length(MODAL_TOKEN_COL_WIDTH),
+        Constraint::Length(MODAL_TOKEN_COL_WIDTH),
+        Constraint::Length(MODAL_REASON_COL_WIDTH),
+        Constraint::Length(MODAL_CONTEXT_COL_WIDTH),
     ];
-    let loaded = turns.len();
-    let count_label = if total_turns > loaded {
-        format!("{loaded}/{total_turns} turns")
+
+    let loaded_messages = messages.len() + unattributed.map(|_| 1).unwrap_or(0);
+    let message_label = if message_total > loaded_messages {
+        format!("{loaded_messages}/{message_total} msgs")
     } else {
-        format!("{loaded} turns")
+        format!("{loaded_messages} msgs")
     };
-    let title =
-        format!("Session Turns – page {page}/{pages} • {count_label} (↑/↓ PgUp/PgDn scroll)");
+    let turn_label = format!("{total_turns} turns");
+    let title = format!(
+        "Session Messages – page {page}/{pages} • {message_label} • {turn_label} (↑/↓ PgUp/PgDn, Enter expand)"
+    );
     let table = Table::new(rows, widths)
         .header(header)
         .block(gray_block(title, theme))
         .column_spacing(1)
         .style(Style::default().fg(theme.text_fg));
     frame.render_widget(table, area);
+}
+
+fn session_message_row(
+    message: &SessionMessage,
+    expanded: bool,
+    note_max: usize,
+    info_max: usize,
+) -> Row<'static> {
+    let local_time = message.timestamp.with_timezone(&Local);
+    let arrow = if expanded { "▼" } else { "▶" };
+    let time_label = format!("{arrow} {}", local_time.format("%H:%M"));
+    let info_label = format!(
+        " {}",
+        truncate_text(&format_count_short(message.turn_count), info_max)
+    );
+    let snippet = format!(" {}", truncate_text(&message.snippet, note_max));
+    let included = message.turn_count > 0;
+
+    Row::new(vec![
+        Cell::from(time_label),
+        Cell::from(info_label),
+        Cell::from(snippet),
+        Cell::from(align_right(
+            format_turn_cost(included, message.cost_usd),
+            10,
+        )),
+        Cell::from(align_right(
+            format_turn_tokens(included, message.prompt_tokens),
+            7,
+        )),
+        Cell::from(align_right(
+            format_turn_tokens(included, message.cached_prompt_tokens),
+            7,
+        )),
+        Cell::from(align_right(
+            format_turn_tokens(included, message.blended_total()),
+            7,
+        )),
+        Cell::from(align_right(
+            format_turn_tokens(included, message.completion_tokens),
+            7,
+        )),
+        Cell::from(align_right(
+            format_turn_tokens(included, message.total_tokens),
+            7,
+        )),
+        Cell::from(align_right(
+            format_turn_tokens(included, message.reasoning_tokens),
+            9,
+        )),
+        Cell::from(""),
+    ])
+}
+
+fn session_turn_row(turn: &SessionTurn, note_max: usize, info_max: usize) -> Row<'static> {
+    let local_time = turn.timestamp.with_timezone(&Local);
+    let model = format!(
+        " {}",
+        format_model_effort(&turn.model, turn.reasoning_effort.as_deref(), info_max)
+    );
+    let note = turn
+        .note
+        .as_ref()
+        .map(|value| truncate_text(value, note_max))
+        .unwrap_or_else(|| "—".to_string());
+    let dim_style = Style::default().fg(Color::Rgb(140, 140, 140));
+
+    Row::new(vec![
+        Cell::from(format!("  {}", local_time.format("%H:%M:%S"))).style(dim_style),
+        Cell::from(model).style(dim_style),
+        Cell::from(format!(" {}", note)).style(dim_style),
+        Cell::from(align_right(
+            format_turn_cost(turn.usage_included, turn.cost_usd),
+            10,
+        ))
+        .style(dim_style),
+        Cell::from(align_right(
+            format_turn_tokens(turn.usage_included, turn.prompt_tokens),
+            7,
+        ))
+        .style(dim_style),
+        Cell::from(align_right(
+            format_turn_tokens(turn.usage_included, turn.cached_prompt_tokens),
+            7,
+        ))
+        .style(dim_style),
+        Cell::from(align_right(
+            format_turn_tokens(turn.usage_included, turn.blended_total()),
+            7,
+        ))
+        .style(dim_style),
+        Cell::from(align_right(
+            format_turn_tokens(turn.usage_included, turn.completion_tokens),
+            7,
+        ))
+        .style(dim_style),
+        Cell::from(align_right(
+            format_turn_tokens(turn.usage_included, turn.total_tokens),
+            7,
+        ))
+        .style(dim_style),
+        Cell::from(align_right(
+            format_turn_tokens(turn.usage_included, turn.reasoning_tokens),
+            9,
+        ))
+        .style(dim_style),
+        Cell::from(Line::from(ctx_gauge_spans(
+            turn.total_tokens,
+            turn.context_window,
+        ))),
+    ])
+}
+
+fn session_placeholder_row(label: &str) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(""),
+        Cell::from(""),
+        Cell::from(format!(" {label}")),
+        Cell::from(""),
+        Cell::from(""),
+        Cell::from(""),
+        Cell::from(""),
+        Cell::from(""),
+        Cell::from(""),
+        Cell::from(""),
+        Cell::from(""),
+    ])
+    .style(Style::default().fg(Color::DarkGray))
 }
 
 fn session_day_totals_row(date: NaiveDate, totals: Option<&AggregateTotals>) -> Row<'static> {
@@ -2249,16 +2578,15 @@ fn session_day_totals_row(date: NaiveDate, totals: Option<&AggregateTotals>) -> 
         Cell::from(""),
         Cell::from(""),
         Cell::from(""),
-        Cell::from(""),
     ];
     if let Some(totals) = totals {
-        cells[4] = Cell::from(align_right(format_cost(totals.cost_usd), 10));
-        cells[5] = Cell::from(align_right(format_tokens(totals.prompt_tokens), 7));
-        cells[6] = Cell::from(align_right(format_tokens(totals.cached_prompt_tokens), 7));
-        cells[7] = Cell::from(align_right(format_tokens(totals.blended_total()), 7));
-        cells[8] = Cell::from(align_right(format_tokens(totals.completion_tokens), 7));
-        cells[9] = Cell::from(align_right(format_tokens(totals.total_tokens), 7));
-        cells[10] = Cell::from(align_right(format_tokens(totals.reasoning_tokens), 9));
+        cells[3] = Cell::from(align_right(format_cost(totals.cost_usd), 10));
+        cells[4] = Cell::from(align_right(format_tokens(totals.prompt_tokens), 7));
+        cells[5] = Cell::from(align_right(format_tokens(totals.cached_prompt_tokens), 7));
+        cells[6] = Cell::from(align_right(format_tokens(totals.blended_total()), 7));
+        cells[7] = Cell::from(align_right(format_tokens(totals.completion_tokens), 7));
+        cells[8] = Cell::from(align_right(format_tokens(totals.total_tokens), 7));
+        cells[9] = Cell::from(align_right(format_tokens(totals.reasoning_tokens), 9));
     }
     Row::new(cells).style(
         Style::default()
@@ -2270,7 +2598,6 @@ fn session_day_totals_row(date: NaiveDate, totals: Option<&AggregateTotals>) -> 
 fn session_summary_row(totals: &AggregateTotals) -> Row<'static> {
     let cells = vec![
         Cell::from("Total"),
-        Cell::from(""),
         Cell::from(""),
         Cell::from(""),
         Cell::from(align_right(format_cost(totals.cost_usd), 10)),
@@ -2290,6 +2617,16 @@ fn session_summary_row(totals: &AggregateTotals) -> Row<'static> {
 }
 
 fn format_tokens(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_count_short(value: u64) -> String {
     if value >= 1_000_000 {
         format!("{:.1}M", value as f64 / 1_000_000.0)
     } else if value >= 1_000 {
@@ -2494,6 +2831,33 @@ fn format_turn_effort(effort: Option<&str>) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
+fn format_model_effort(model: &str, effort: Option<&str>, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let effort_label = format_turn_effort(effort);
+    let effort_len = effort_label.chars().count();
+    if effort_len >= max_width {
+        return truncate_text(&effort_label, max_width);
+    }
+    let sep = " / ";
+    let sep_len = sep.chars().count();
+    if effort_len + sep_len >= max_width {
+        return truncate_text(&effort_label, max_width);
+    }
+    let model_budget = max_width.saturating_sub(effort_len + sep_len);
+    if model_budget == 0 {
+        return effort_label;
+    }
+    let model_trimmed = model.trim();
+    if model_trimmed.is_empty() {
+        return effort_label;
+    }
+    let model_label = truncate_text(model_trimmed, model_budget);
+    format!("{model_label}{sep}{effort_label}")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_key_event(
     key: KeyEvent,
     view_mode: &mut ViewMode,
@@ -2508,7 +2872,11 @@ fn handle_key_event(
     recent_total: usize,
     recent_offset: usize,
     top_spending_rows: &[SessionAggregate],
-    session_turns_len: usize,
+    modal_messages: &[SessionMessage],
+    modal_unattributed: Option<&SessionMessage>,
+    modal_turns_by_message: &HashMap<MessageGroupKey, Vec<SessionTurn>>,
+    modal_daily_totals: &HashMap<NaiveDate, AggregateTotals>,
+    modal_turn_totals: Option<&AggregateTotals>,
     session_turns_total: usize,
     modal_model_mix: &[ModelUsageRow],
     modal_tool_counts: &[ToolCountRow],
@@ -2547,7 +2915,11 @@ fn handle_key_event(
         if handle_session_modal_input(
             session_modal,
             key,
-            session_turns_len,
+            modal_messages,
+            modal_unattributed,
+            modal_turns_by_message,
+            modal_daily_totals,
+            modal_turn_totals,
             session_turns_total,
             selected_session,
             modal_model_mix,
@@ -2557,10 +2929,9 @@ fn handle_key_event(
         }
     }
 
-    if *view_mode == ViewMode::Pricing {
-        if handle_pricing_keys(key, runtime, storage, pricing_config) {
-            return false;
-        }
+    if *view_mode == ViewMode::Pricing && handle_pricing_keys(key, runtime, storage, pricing_config)
+    {
+        return false;
     }
 
     match key.code {
@@ -2672,14 +3043,14 @@ fn handle_key_event(
             _ => {}
         },
         KeyCode::Char(ch) => {
-            if matches!(view_mode, ViewMode::TopSpending | ViewMode::Stats) {
-                if let Some(range) = TimeRange::from_key(ch) {
-                    if matches!(view_mode, ViewMode::TopSpending) {
-                        top_spending_view.nav.set_range(range, today);
-                        top_spending_view.list.reset();
-                    } else {
-                        stats_view.nav.set_range(range, today);
-                    }
+            if matches!(view_mode, ViewMode::TopSpending | ViewMode::Stats)
+                && let Some(range) = TimeRange::from_key(ch)
+            {
+                if matches!(view_mode, ViewMode::TopSpending) {
+                    top_spending_view.nav.set_range(range, today);
+                    top_spending_view.list.reset();
+                } else {
+                    stats_view.nav.set_range(range, today);
                 }
             }
         }
@@ -2711,39 +3082,96 @@ fn handle_missing_modal_input(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_session_modal_input(
     modal: &mut SessionModalState,
     key: KeyEvent,
-    total_rows: usize,
-    turn_count: usize,
+    messages: &[SessionMessage],
+    unattributed: Option<&SessionMessage>,
+    turns_by_message: &HashMap<MessageGroupKey, Vec<SessionTurn>>,
+    daily_totals: &HashMap<NaiveDate, AggregateTotals>,
+    summary_totals: Option<&AggregateTotals>,
+    total_turns: usize,
     selected: Option<&SessionAggregate>,
     model_mix: &[ModelUsageRow],
     tool_counts: &[ToolCountRow],
 ) -> bool {
+    let show_summary = daily_totals.len() > 1 && summary_totals.is_some();
+    let cache_key = modal_row_cache_key(
+        messages,
+        unattributed,
+        modal.expanded_key(),
+        show_summary,
+        turns_by_message,
+    );
+    if modal.row_cache().is_empty() || modal.row_cache_key() != Some(cache_key) {
+        let rows = build_session_modal_row_descriptors(
+            messages,
+            unattributed,
+            modal.expanded_key(),
+            turns_by_message,
+            show_summary,
+        );
+        modal.set_row_cache(rows, cache_key);
+    }
+    modal.ensure_selectable(true);
+
     match key.code {
         KeyCode::Esc => {
             modal.close();
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            modal.scroll_up(total_rows);
+            modal.move_selection_up();
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            modal.scroll_down(total_rows);
+            modal.move_selection_down();
         }
         KeyCode::PageUp => {
-            modal.page_up(total_rows);
+            modal.page_up();
         }
         KeyCode::PageDown => {
-            modal.page_down(total_rows);
+            modal.page_down();
+        }
+        KeyCode::Enter => {
+            let current_row = modal.selected_row();
+            if let Some(ModalRowDescriptor::Message { key, .. }) =
+                modal.row_cache().get(current_row)
+            {
+                let key = *key;
+                modal.toggle_expand(key);
+                let updated_rows = build_session_modal_row_descriptors(
+                    messages,
+                    unattributed,
+                    modal.expanded_key(),
+                    turns_by_message,
+                    show_summary,
+                );
+                let cache_key = modal_row_cache_key(
+                    messages,
+                    unattributed,
+                    modal.expanded_key(),
+                    show_summary,
+                    turns_by_message,
+                );
+                modal.set_row_cache(updated_rows, cache_key);
+                if let Some(idx) = find_modal_message_row(modal.row_cache(), key) {
+                    modal.select_row(idx);
+                }
+            }
         }
         KeyCode::Char('y') | KeyCode::Char('Y')
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
         {
             if let Some(aggregate) = selected {
-                let resolved_turns = if turn_count == 0 {
-                    total_rows
+                let fallback_turns: u64 = messages
+                    .iter()
+                    .map(|message| message.turn_count)
+                    .sum::<u64>()
+                    + unattributed.map(|message| message.turn_count).unwrap_or(0);
+                let resolved_turns = if total_turns == 0 {
+                    fallback_turns as usize
                 } else {
-                    turn_count
+                    total_turns
                 };
                 if let Err(err) =
                     copy_session_details_osc52(aggregate, resolved_turns, model_mix, tool_counts)
@@ -2804,6 +3232,8 @@ struct HeroMetric {
     total: AggregateTotals,
     delta: Option<f64>,
     budget: Option<f64>,
+    session_count: u64,
+    message_count: u64,
 }
 
 struct HeroStats {
@@ -2819,16 +3249,22 @@ impl Default for HeroStats {
                 total: AggregateTotals::default(),
                 delta: None,
                 budget: None,
+                session_count: 0,
+                message_count: 0,
             },
             week: HeroMetric {
                 total: AggregateTotals::default(),
                 delta: None,
                 budget: None,
+                session_count: 0,
+                message_count: 0,
             },
             month: HeroMetric {
                 total: AggregateTotals::default(),
                 delta: None,
                 budget: None,
+                session_count: 0,
+                message_count: 0,
             },
         }
     }
@@ -2863,6 +3299,16 @@ impl HeroStats {
             .totals_between_timestamps(month_period.start, month_period.end)
             .await?;
 
+        let today_counts = storage
+            .counts_between_timestamps(today_period.start, today_period.end)
+            .await?;
+        let week_counts = storage
+            .counts_between_timestamps(week_period.start, week_period.end)
+            .await?;
+        let month_counts = storage
+            .counts_between_timestamps(month_period.start, month_period.end)
+            .await?;
+
         let today_prev_totals = storage
             .totals_between_timestamps(today_prev.start, today_prev.end)
             .await?;
@@ -2878,16 +3324,22 @@ impl HeroStats {
                 total: today_totals.clone(),
                 delta: cost_delta(today_totals.cost_usd, today_prev_totals.cost_usd),
                 budget: alerts.daily_budget_usd,
+                session_count: today_counts.session_count,
+                message_count: today_counts.message_count,
             },
             week: HeroMetric {
                 total: week_totals.clone(),
                 delta: cost_delta(week_totals.cost_usd, week_prev_totals.cost_usd),
                 budget: None,
+                session_count: week_counts.session_count,
+                message_count: week_counts.message_count,
             },
             month: HeroMetric {
                 total: month_totals.clone(),
                 delta: cost_delta(month_totals.cost_usd, month_prev_totals.cost_usd),
                 budget: alerts.monthly_budget_usd,
+                session_count: month_counts.session_count,
+                message_count: month_counts.message_count,
             },
         })
     }
@@ -3163,7 +3615,7 @@ fn local_start_of_day(date: NaiveDate) -> DateTime<Utc> {
         LocalResult::None => Local
             .from_local_datetime(&(naive + ChronoDuration::hours(1)))
             .earliest()
-            .unwrap_or_else(|| Local::now())
+            .unwrap_or_else(Local::now)
             .with_timezone(&Utc),
     }
 }
@@ -3266,7 +3718,7 @@ impl ListState {
         if total_rows == 0 || self.visible_rows == 0 {
             return (1, 1);
         }
-        let pages = (total_rows + self.visible_rows - 1) / self.visible_rows;
+        let pages = total_rows.div_ceil(self.visible_rows);
         let page = if self.scroll_offset + self.visible_rows >= total_rows {
             pages
         } else {
@@ -3368,20 +3820,120 @@ impl TopSpendingViewState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum MessageGroupKey {
+    Message(i64),
+    Unattributed,
+}
+
+enum ModalRowDescriptor {
+    Summary,
+    Day {
+        date: NaiveDate,
+    },
+    Message {
+        key: MessageGroupKey,
+        message_index: Option<usize>,
+        expanded: bool,
+    },
+    Turn {
+        key: MessageGroupKey,
+        turn_index: usize,
+    },
+    Placeholder {
+        label: &'static str,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ModalRowCacheKey {
+    message_count: usize,
+    has_unattributed: bool,
+    expanded: Option<MessageGroupKey>,
+    expanded_turns_len: Option<usize>,
+    show_summary: bool,
+}
+
+fn modal_row_cache_key(
+    messages: &[SessionMessage],
+    unattributed: Option<&SessionMessage>,
+    expanded: Option<MessageGroupKey>,
+    show_summary: bool,
+    turns_by_message: &HashMap<MessageGroupKey, Vec<SessionTurn>>,
+) -> ModalRowCacheKey {
+    let expanded_turns_len =
+        expanded.and_then(|key| turns_by_message.get(&key).map(|turns| turns.len()));
+    ModalRowCacheKey {
+        message_count: messages.len(),
+        has_unattributed: unattributed.is_some(),
+        expanded,
+        expanded_turns_len,
+        show_summary,
+    }
+}
+
+fn is_modal_row_selectable(row: &ModalRowDescriptor) -> bool {
+    matches!(
+        row,
+        ModalRowDescriptor::Message { .. } | ModalRowDescriptor::Turn { .. }
+    )
+}
+
+fn find_modal_selectable(
+    rows: &[ModalRowDescriptor],
+    start: usize,
+    direction: i32,
+) -> Option<usize> {
+    if rows.is_empty() {
+        return None;
+    }
+    let dir = if direction >= 0 { 1 } else { -1 };
+    if dir > 0 {
+        for (idx, row) in rows.iter().enumerate().skip(start) {
+            if is_modal_row_selectable(row) {
+                return Some(idx);
+            }
+        }
+    } else {
+        let mut idx = start.min(rows.len().saturating_sub(1));
+        loop {
+            if is_modal_row_selectable(&rows[idx]) {
+                return Some(idx);
+            }
+            if idx == 0 {
+                break;
+            }
+            idx -= 1;
+        }
+    }
+    None
+}
+
+fn find_modal_message_row(rows: &[ModalRowDescriptor], key: MessageGroupKey) -> Option<usize> {
+    rows.iter().enumerate().find_map(|(idx, row)| match row {
+        ModalRowDescriptor::Message { key: row_key, .. } if *row_key == key => Some(idx),
+        _ => None,
+    })
+}
+
 struct SessionModalState {
     open: bool,
-    scroll_offset: usize,
-    visible_rows: usize,
+    list: ListState,
     active_key: Option<String>,
+    expanded: Option<MessageGroupKey>,
+    row_cache: Vec<ModalRowDescriptor>,
+    row_cache_key: Option<ModalRowCacheKey>,
 }
 
 impl SessionModalState {
     fn new() -> Self {
         Self {
             open: false,
-            scroll_offset: 0,
-            visible_rows: 0,
+            list: ListState::new(),
             active_key: None,
+            expanded: None,
+            row_cache: Vec::new(),
+            row_cache_key: None,
         }
     }
 
@@ -3390,83 +3942,157 @@ impl SessionModalState {
     }
 
     fn open_for(&mut self, key: String) {
-        self.scroll_offset = 0;
+        self.list.reset();
         self.active_key = Some(key);
+        self.expanded = None;
+        self.row_cache.clear();
+        self.row_cache_key = None;
         self.open = true;
     }
 
     fn close(&mut self) {
         self.open = false;
         self.active_key = None;
+        self.expanded = None;
+        self.row_cache.clear();
+        self.row_cache_key = None;
     }
 
     fn set_visible_rows(&mut self, visible_rows: usize, total_rows: usize) {
-        self.visible_rows = visible_rows;
-        self.clamp(total_rows);
+        self.list.set_visible_rows(visible_rows, total_rows);
     }
 
-    fn clamp(&mut self, total_rows: usize) {
-        if total_rows == 0 || self.visible_rows == 0 {
-            self.scroll_offset = 0;
+    fn set_row_cache(&mut self, rows: Vec<ModalRowDescriptor>, key: ModalRowCacheKey) {
+        self.row_cache = rows;
+        self.row_cache_key = Some(key);
+        self.list.clamp(self.row_cache.len());
+        self.ensure_selectable(true);
+    }
+
+    fn row_cache(&self) -> &[ModalRowDescriptor] {
+        &self.row_cache
+    }
+
+    fn row_cache_key(&self) -> Option<ModalRowCacheKey> {
+        self.row_cache_key
+    }
+
+    fn select_row(&mut self, idx: usize) {
+        self.list.selected_row = idx;
+        self.list.clamp(self.row_cache.len());
+    }
+
+    fn ensure_selectable(&mut self, prefer_forward: bool) {
+        if self.row_cache.is_empty() {
+            self.list.reset();
             return;
         }
-        let max_scroll = total_rows.saturating_sub(self.visible_rows);
-        if self.scroll_offset > max_scroll {
-            self.scroll_offset = max_scroll;
+        let idx = self
+            .list
+            .selected_row
+            .min(self.row_cache.len().saturating_sub(1));
+        if is_modal_row_selectable(&self.row_cache[idx]) {
+            self.list.clamp(self.row_cache.len());
+            return;
         }
+        let forward = find_modal_selectable(&self.row_cache, idx + 1, 1);
+        let backward = if idx > 0 {
+            find_modal_selectable(&self.row_cache, idx - 1, -1)
+        } else {
+            None
+        };
+        let chosen = if prefer_forward {
+            forward.or(backward)
+        } else {
+            backward.or(forward)
+        };
+        if let Some(next) = chosen {
+            self.list.selected_row = next;
+        }
+        self.list.clamp(self.row_cache.len());
+    }
+
+    fn move_selection_up(&mut self) {
+        let Some(idx) = find_modal_selectable(
+            &self.row_cache,
+            self.list.selected_row.saturating_sub(1),
+            -1,
+        ) else {
+            return;
+        };
+        self.list.selected_row = idx;
+        self.list.clamp(self.row_cache.len());
+    }
+
+    fn move_selection_down(&mut self) {
+        let Some(idx) = find_modal_selectable(&self.row_cache, self.list.selected_row + 1, 1)
+        else {
+            return;
+        };
+        self.list.selected_row = idx;
+        self.list.clamp(self.row_cache.len());
+    }
+
+    fn page_up(&mut self) {
+        let total = self.row_cache.len();
+        if total == 0 {
+            self.list.reset();
+            return;
+        }
+        let step = self.list.visible_rows.max(1);
+        let target = self.list.selected_row.saturating_sub(step);
+        self.move_selection_to(target, -1);
+    }
+
+    fn page_down(&mut self) {
+        let total = self.row_cache.len();
+        if total == 0 {
+            self.list.reset();
+            return;
+        }
+        let step = self.list.visible_rows.max(1);
+        let target = (self.list.selected_row + step).min(total.saturating_sub(1));
+        self.move_selection_to(target, 1);
+    }
+
+    fn move_selection_to(&mut self, target: usize, direction: i32) {
+        let total = self.row_cache.len();
+        if total == 0 {
+            self.list.reset();
+            return;
+        }
+        let dir = if direction >= 0 { 1 } else { -1 };
+        let forward = find_modal_selectable(&self.row_cache, target, dir);
+        let backward_start = target.saturating_sub(1);
+        let backward = find_modal_selectable(&self.row_cache, backward_start, -dir);
+        if let Some(idx) = forward.or(backward) {
+            self.list.selected_row = idx;
+        }
+        self.list.clamp(self.row_cache.len());
+    }
+
+    fn page_info(&self, total_rows: usize) -> (usize, usize) {
+        self.list.page_info(total_rows)
     }
 
     fn scroll_offset(&self) -> usize {
-        self.scroll_offset
+        self.list.scroll_offset
     }
 
-    fn scroll_up(&mut self, total_rows: usize) {
-        if total_rows == 0 {
-            self.scroll_offset = 0;
-            return;
-        }
-        if self.scroll_offset > 0 {
-            self.scroll_offset -= 1;
-        }
+    fn selected_row(&self) -> usize {
+        self.list.selected_row
     }
 
-    fn scroll_down(&mut self, total_rows: usize) {
-        if total_rows == 0 {
-            self.scroll_offset = 0;
-            return;
-        }
-        if self.visible_rows == 0 {
-            return;
-        }
-        let max_scroll = total_rows.saturating_sub(self.visible_rows);
-        if self.scroll_offset < max_scroll {
-            self.scroll_offset += 1;
-        }
+    fn expanded_key(&self) -> Option<MessageGroupKey> {
+        self.expanded
     }
 
-    fn page_up(&mut self, total_rows: usize) {
-        if total_rows == 0 {
-            self.scroll_offset = 0;
-            return;
+    fn toggle_expand(&mut self, key: MessageGroupKey) {
+        if self.expanded == Some(key) {
+            self.expanded = None;
+        } else {
+            self.expanded = Some(key);
         }
-        if self.visible_rows == 0 {
-            return;
-        }
-        let step = self.visible_rows.max(1);
-        self.scroll_offset = self.scroll_offset.saturating_sub(step);
-    }
-
-    fn page_down(&mut self, total_rows: usize) {
-        if total_rows == 0 {
-            self.scroll_offset = 0;
-            return;
-        }
-        if self.visible_rows == 0 {
-            return;
-        }
-        let step = self.visible_rows.max(1);
-        let max_scroll = total_rows.saturating_sub(self.visible_rows);
-        self.scroll_offset = (self.scroll_offset + step).min(max_scroll);
     }
 }
 
@@ -3689,6 +4315,11 @@ fn session_detail_rows(
             format_detail_snippet(aggregate.last_summary.as_ref()),
             theme,
         ),
+        detail_row(
+            "Messages",
+            format_count_short(aggregate.user_messages),
+            theme,
+        ),
         detail_row_spans("CWD", cwd_spans, theme),
         detail_row_spans("Repo", repo_spans, theme),
         detail_row(
@@ -3800,7 +4431,7 @@ fn pad_right(value: &str, width: usize) -> String {
     }
     let mut out = String::with_capacity(width);
     out.push_str(value);
-    out.extend(std::iter::repeat(' ').take(width - len));
+    out.extend(std::iter::repeat_n(' ', width - len));
     out
 }
 
@@ -4051,6 +4682,7 @@ fn build_session_share_text(
 ) -> String {
     let mut lines = Vec::new();
     lines.push(format!("Cost: {}", format_cost(aggregate.cost_usd)));
+    lines.push(format!("Messages: {}", aggregate.user_messages));
     lines.push(format!("Turns: {turn_count}"));
     lines.push(format!("Tokens: {}", session_token_summary(aggregate)));
     lines.push(format!("Models: {}", format_model_mix_plain(model_mix)));

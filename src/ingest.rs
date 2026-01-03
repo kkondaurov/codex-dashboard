@@ -17,6 +17,7 @@ use tokio::{sync::oneshot, task::JoinHandle, time};
 
 const TITLE_MAX_CHARS: usize = 200;
 const SUMMARY_MAX_CHARS: usize = 160;
+const MESSAGE_DEDUPE_WINDOW_SECS: i64 = 2;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct TokenTotals {
@@ -75,6 +76,19 @@ impl TokenTotals {
     }
 }
 
+#[derive(Clone)]
+struct PendingMessage {
+    timestamp: Option<DateTime<Utc>>,
+    snippet: String,
+    seq: u64,
+}
+
+#[derive(Clone)]
+struct LastUserMessage {
+    timestamp: Option<DateTime<Utc>>,
+    snippet: String,
+}
+
 struct FileState {
     session_id: Option<String>,
     last_offset: u64,
@@ -82,11 +96,15 @@ struct FileState {
     last_committed: TokenTotals,
     current_model: Option<String>,
     current_effort: Option<String>,
+    current_message_id: Option<i64>,
+    current_message_seq: u64,
     pending_note: Option<String>,
     pending_note_seq: u64,
     used_note_seq: u64,
     pending_title: Option<String>,
     pending_summary: Option<String>,
+    pending_messages: Vec<PendingMessage>,
+    last_user_message: Option<LastUserMessage>,
 }
 
 impl FileState {
@@ -98,11 +116,15 @@ impl FileState {
             last_committed: TokenTotals::default(),
             current_model: None,
             current_effort: None,
+            current_message_id: None,
+            current_message_seq: 0,
             pending_note: None,
             pending_note_seq: 0,
             used_note_seq: 0,
             pending_title: None,
             pending_summary: None,
+            pending_messages: Vec::new(),
+            last_user_message: None,
         }
     }
 
@@ -126,15 +148,19 @@ impl FileState {
             },
             current_model: state.current_model.clone(),
             current_effort: state.current_effort.clone(),
+            current_message_id: state.current_message_id,
+            current_message_seq: state.current_message_seq,
             pending_note: None,
             pending_note_seq: 0,
             used_note_seq: 0,
             pending_title: None,
             pending_summary: None,
+            pending_messages: Vec::new(),
+            last_user_message: None,
         }
     }
 
-    fn into_state(&self, path: &Path) -> IngestStateRow {
+    fn to_state_row(&self, path: &Path) -> IngestStateRow {
         IngestStateRow {
             path: path.to_path_buf(),
             session_id: self.session_id.clone(),
@@ -149,6 +175,8 @@ impl FileState {
             last_committed_output_tokens: self.last_committed.output_tokens,
             last_committed_reasoning_output_tokens: self.last_committed.reasoning_output_tokens,
             last_committed_total_tokens: self.last_committed.total_tokens,
+            current_message_id: self.current_message_id,
+            current_message_seq: self.current_message_seq,
             current_model: self.current_model.clone(),
             current_effort: self.current_effort.clone(),
         }
@@ -262,6 +290,10 @@ impl SessionIngestor {
             state.pending_note = None;
             state.pending_note_seq = 0;
             state.used_note_seq = 0;
+            state.current_message_id = None;
+            state.current_message_seq = 0;
+            state.pending_messages.clear();
+            state.last_user_message = None;
         }
 
         let (lines, new_offset) = read_new_lines(path, state.last_offset)?;
@@ -283,7 +315,7 @@ impl SessionIngestor {
         }
 
         state.last_offset = new_offset;
-        let ingest_state = state.into_state(path);
+        let ingest_state = state.to_state_row(path);
         self.storage.upsert_ingest_state(&ingest_state).await?;
         self.files.insert(path.to_path_buf(), state);
         Ok(())
@@ -314,6 +346,10 @@ async fn process_event(storage: &Storage, state: &mut FileState, value: &Value) 
                         .set_session_summary(&meta.session_id, &summary, meta.last_event_at)
                         .await?;
                 }
+                if !state.pending_messages.is_empty() {
+                    flush_pending_messages(storage, state, &meta.session_id, meta.last_event_at)
+                        .await?;
+                }
             }
         }
         "turn_context" => {
@@ -337,9 +373,7 @@ async fn process_event(storage: &Storage, state: &mut FileState, value: &Value) 
                     }
                     Some("user_message") => {
                         if let Some(message) = payload.get("message").and_then(|v| v.as_str()) {
-                            if let Some(title) = format_snippet(message, TITLE_MAX_CHARS) {
-                                apply_title(storage, state, &title).await?;
-                            }
+                            handle_user_message(storage, state, message, timestamp).await?;
                         }
                     }
                     Some("agent_message") => {
@@ -354,11 +388,11 @@ async fn process_event(storage: &Storage, state: &mut FileState, value: &Value) 
                         }
                     }
                     Some("agent_reasoning") => {
-                        if let Some(text) = payload.get("text").and_then(|v| v.as_str()) {
-                            if let Some(note) = format_snippet(text, SUMMARY_MAX_CHARS) {
-                                state.pending_note = Some(format_reasoning_note(&note));
-                                state.pending_note_seq = state.pending_note_seq.saturating_add(1);
-                            }
+                        if let Some(text) = payload.get("text").and_then(|v| v.as_str())
+                            && let Some(note) = format_snippet(text, SUMMARY_MAX_CHARS)
+                        {
+                            state.pending_note = Some(format_reasoning_note(&note));
+                            state.pending_note_seq = state.pending_note_seq.saturating_add(1);
                         }
                     }
                     _ => {}
@@ -369,22 +403,19 @@ async fn process_event(storage: &Storage, state: &mut FileState, value: &Value) 
             if let Some(payload) = value.get("payload") {
                 match payload.get("type").and_then(|v| v.as_str()) {
                     Some("message") => {
-                        if let Some(role) = payload.get("role").and_then(|v| v.as_str()) {
-                            if let Some(text) = extract_message_text(payload) {
-                                if role.eq_ignore_ascii_case("user") {
-                                    if let Some(title) = format_snippet(&text, TITLE_MAX_CHARS) {
-                                        apply_title(storage, state, &title).await?;
-                                    }
-                                } else if role.eq_ignore_ascii_case("assistant") {
-                                    if let Some(summary) = format_snippet(&text, SUMMARY_MAX_CHARS)
-                                    {
-                                        apply_summary(storage, state, &summary, timestamp).await?;
-                                    }
-                                    if let Some(note) = format_snippet(&text, SUMMARY_MAX_CHARS) {
-                                        state.pending_note = Some(note);
-                                        state.pending_note_seq =
-                                            state.pending_note_seq.saturating_add(1);
-                                    }
+                        if let Some(role) = payload.get("role").and_then(|v| v.as_str())
+                            && let Some(text) = extract_message_text(payload)
+                        {
+                            if role.eq_ignore_ascii_case("user") {
+                                handle_user_message(storage, state, &text, timestamp).await?;
+                            } else if role.eq_ignore_ascii_case("assistant") {
+                                if let Some(summary) = format_snippet(&text, SUMMARY_MAX_CHARS) {
+                                    apply_summary(storage, state, &summary, timestamp).await?;
+                                }
+                                if let Some(note) = format_snippet(&text, SUMMARY_MAX_CHARS) {
+                                    state.pending_note = Some(note);
+                                    state.pending_note_seq =
+                                        state.pending_note_seq.saturating_add(1);
                                 }
                             }
                         }
@@ -454,6 +485,85 @@ async fn apply_summary(
         storage.set_session_summary(session_id, summary, ts).await
     } else {
         storage.set_session_summary_only(session_id, summary).await
+    }
+}
+
+async fn handle_user_message(
+    storage: &Storage,
+    state: &mut FileState,
+    message: &str,
+    timestamp: Option<DateTime<Utc>>,
+) -> Result<()> {
+    let Some(snippet) = format_snippet(message, TITLE_MAX_CHARS) else {
+        return Ok(());
+    };
+
+    if should_skip_duplicate_message(state, &snippet, timestamp) {
+        return Ok(());
+    }
+
+    state.current_message_seq = state.current_message_seq.saturating_add(1);
+    let seq = state.current_message_seq;
+
+    apply_title(storage, state, &snippet).await?;
+
+    if let Some(session_id) = state.session_id.as_deref() {
+        let ts = timestamp.unwrap_or_else(Utc::now);
+        let message_id = storage
+            .record_user_message(session_id, ts, &snippet, seq)
+            .await?;
+        state.current_message_id = (message_id > 0).then_some(message_id);
+    } else {
+        state.pending_messages.push(PendingMessage {
+            timestamp,
+            snippet: snippet.clone(),
+            seq,
+        });
+        state.current_message_id = None;
+    }
+
+    state.last_user_message = Some(LastUserMessage { timestamp, snippet });
+    Ok(())
+}
+
+async fn flush_pending_messages(
+    storage: &Storage,
+    state: &mut FileState,
+    session_id: &str,
+    fallback_timestamp: DateTime<Utc>,
+) -> Result<()> {
+    let pending = std::mem::take(&mut state.pending_messages);
+    let mut latest_id = state.current_message_id;
+    for message in pending {
+        let ts = message.timestamp.unwrap_or(fallback_timestamp);
+        let message_id = storage
+            .record_user_message(session_id, ts, &message.snippet, message.seq)
+            .await?;
+        if message_id > 0 {
+            latest_id = Some(message_id);
+        }
+    }
+    state.current_message_id = latest_id;
+    Ok(())
+}
+
+fn should_skip_duplicate_message(
+    state: &FileState,
+    snippet: &str,
+    timestamp: Option<DateTime<Utc>>,
+) -> bool {
+    let Some(last) = state.last_user_message.as_ref() else {
+        return false;
+    };
+    if last.snippet != snippet {
+        return false;
+    }
+    match (last.timestamp, timestamp) {
+        (Some(prev), Some(current)) => {
+            let delta = current.signed_duration_since(prev).num_seconds().abs();
+            delta <= MESSAGE_DEDUPE_WINDOW_SECS
+        }
+        _ => true,
     }
 }
 
@@ -528,6 +638,7 @@ async fn handle_token_count(
             delta.output_tokens,
             delta.reasoning_output_tokens,
             delta.total_tokens,
+            state.current_message_id,
         )
         .await?;
 
@@ -660,20 +771,18 @@ fn extract_message_text(payload: &Value) -> Option<String> {
     if let Some(arr) = content.as_array() {
         let mut acc = String::new();
         for entry in arr {
-            if let Some(text) = entry.get("text").and_then(|v| v.as_str()) {
-                if !text.trim().is_empty() {
-                    if !acc.is_empty() {
-                        acc.push(' ');
-                    }
-                    acc.push_str(text.trim());
+            if let Some(text) = entry.get("text").and_then(|v| v.as_str())
+                && !text.trim().is_empty()
+            {
+                if !acc.is_empty() {
+                    acc.push(' ');
                 }
+                acc.push_str(text.trim());
             }
         }
         if acc.is_empty() { None } else { Some(acc) }
-    } else if let Some(text) = content.as_str() {
-        Some(text.to_string())
     } else {
-        None
+        content.as_str().map(|text| text.to_string())
     }
 }
 
@@ -682,10 +791,7 @@ fn format_snippet(text: &str, max_chars: usize) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    let filtered = match filter_title_candidate(trimmed) {
-        Some(value) => value,
-        None => return None,
-    };
+    let filtered = filter_title_candidate(trimmed)?;
     let mut collapsed = String::new();
     for word in filtered.split_whitespace() {
         if !collapsed.is_empty() {
@@ -787,24 +893,24 @@ fn web_search_note(payload: &Value) -> Option<String> {
 fn reasoning_summary_note(payload: &Value) -> Option<String> {
     if let Some(summary) = payload.get("summary").and_then(|v| v.as_array()) {
         for entry in summary {
-            if let Some(text) = entry.get("text").and_then(|v| v.as_str()) {
-                if let Some(snippet) = format_snippet(text, SUMMARY_MAX_CHARS) {
-                    return Some(format_reasoning_note(&snippet));
-                }
-            } else if let Some(text) = entry.as_str() {
-                if let Some(snippet) = format_snippet(text, SUMMARY_MAX_CHARS) {
-                    return Some(format_reasoning_note(&snippet));
-                }
+            if let Some(text) = entry.get("text").and_then(|v| v.as_str())
+                && let Some(snippet) = format_snippet(text, SUMMARY_MAX_CHARS)
+            {
+                return Some(format_reasoning_note(&snippet));
+            } else if let Some(text) = entry.as_str()
+                && let Some(snippet) = format_snippet(text, SUMMARY_MAX_CHARS)
+            {
+                return Some(format_reasoning_note(&snippet));
             }
         }
     }
 
     if let Some(content) = payload.get("content").and_then(|v| v.as_array()) {
         for entry in content {
-            if let Some(text) = entry.get("text").and_then(|v| v.as_str()) {
-                if let Some(snippet) = format_snippet(text, SUMMARY_MAX_CHARS) {
-                    return Some(format_reasoning_note(&snippet));
-                }
+            if let Some(text) = entry.get("text").and_then(|v| v.as_str())
+                && let Some(snippet) = format_snippet(text, SUMMARY_MAX_CHARS)
+            {
+                return Some(format_reasoning_note(&snippet));
             }
         }
     }

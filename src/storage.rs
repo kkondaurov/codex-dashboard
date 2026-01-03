@@ -151,6 +151,10 @@ impl Storage {
             .execute(&mut *tx)
             .await
             .with_context(|| "failed to clear session_turns")?;
+        sqlx::query("DELETE FROM session_messages;")
+            .execute(&mut *tx)
+            .await
+            .with_context(|| "failed to clear session_messages")?;
         sqlx::query("DELETE FROM session_daily_stats;")
             .execute(&mut *tx)
             .await
@@ -168,7 +172,7 @@ impl Storage {
             .await
             .with_context(|| "failed to clear ingest_state")?;
         let _ = sqlx::query(
-            "DELETE FROM sqlite_sequence WHERE name IN ('session_turns','session_tool_calls');",
+            "DELETE FROM sqlite_sequence WHERE name IN ('session_turns','session_tool_calls','session_messages');",
         )
         .execute(&mut *tx)
         .await;
@@ -255,7 +259,8 @@ impl Storage {
                 cached_prompt_tokens INTEGER NOT NULL DEFAULT 0,
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
                 reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-                total_tokens INTEGER NOT NULL DEFAULT 0
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                user_messages INTEGER NOT NULL DEFAULT 0
             );
             "#,
         )
@@ -270,6 +275,18 @@ impl Storage {
                 .await
                 .with_context(|| "failed to add sessions.subagent column")?;
         }
+        let has_user_messages = self
+            .table_has_column("sessions", "user_messages")
+            .await
+            .unwrap_or(false);
+        if !has_user_messages {
+            sqlx::query(
+                "ALTER TABLE sessions ADD COLUMN user_messages INTEGER NOT NULL DEFAULT 0;",
+            )
+            .execute(&*self.pool)
+            .await
+            .with_context(|| "failed to add sessions.user_messages column")?;
+        }
 
         sqlx::query(
             r#"
@@ -281,12 +298,14 @@ impl Storage {
                 note TEXT,
                 context_window INTEGER,
                 reasoning_effort TEXT,
+                message_id INTEGER,
                 prompt_tokens INTEGER NOT NULL,
                 cached_prompt_tokens INTEGER NOT NULL,
                 completion_tokens INTEGER NOT NULL,
                 reasoning_tokens INTEGER NOT NULL,
                 total_tokens INTEGER NOT NULL,
-                FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+                FOREIGN KEY (session_id) REFERENCES sessions(session_id),
+                FOREIGN KEY (message_id) REFERENCES session_messages(id)
             );
             "#,
         )
@@ -312,6 +331,33 @@ impl Storage {
                 .await
                 .with_context(|| "failed to add session_turns.reasoning_effort column")?;
         }
+        let has_message_id = self
+            .table_has_column("session_turns", "message_id")
+            .await
+            .unwrap_or(false);
+        if !has_message_id {
+            sqlx::query("ALTER TABLE session_turns ADD COLUMN message_id INTEGER;")
+                .execute(&*self.pool)
+                .await
+                .with_context(|| "failed to add session_turns.message_id column")?;
+        }
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS session_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                role TEXT NOT NULL,
+                snippet TEXT NOT NULL,
+                message_seq INTEGER NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+            );
+            "#,
+        )
+        .execute(&*self.pool)
+        .await
+        .with_context(|| "failed to ensure session_messages schema")?;
 
         sqlx::query(
             r#"
@@ -366,6 +412,8 @@ impl Storage {
                 last_committed_output_tokens INTEGER NOT NULL DEFAULT 0,
                 last_committed_reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
                 last_committed_total_tokens INTEGER NOT NULL DEFAULT 0,
+                current_message_id INTEGER,
+                current_message_seq INTEGER NOT NULL DEFAULT 0,
                 current_model TEXT,
                 current_effort TEXT
             );
@@ -383,6 +431,28 @@ impl Storage {
                 .execute(&*self.pool)
                 .await
                 .with_context(|| "failed to add ingest_state.current_effort column")?;
+        }
+        let has_current_message_id = self
+            .table_has_column("ingest_state", "current_message_id")
+            .await
+            .unwrap_or(false);
+        if !has_current_message_id {
+            sqlx::query("ALTER TABLE ingest_state ADD COLUMN current_message_id INTEGER;")
+                .execute(&*self.pool)
+                .await
+                .with_context(|| "failed to add ingest_state.current_message_id column")?;
+        }
+        let has_current_message_seq = self
+            .table_has_column("ingest_state", "current_message_seq")
+            .await
+            .unwrap_or(false);
+        if !has_current_message_seq {
+            sqlx::query(
+                "ALTER TABLE ingest_state ADD COLUMN current_message_seq INTEGER NOT NULL DEFAULT 0;",
+            )
+            .execute(&*self.pool)
+            .await
+            .with_context(|| "failed to add ingest_state.current_message_seq column")?;
         }
 
         sqlx::query(
@@ -439,6 +509,36 @@ impl Storage {
         .execute(&*self.pool)
         .await
         .with_context(|| "failed to ensure session_turns timestamp index")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_session_turns_message
+            ON session_turns(message_id);
+            "#,
+        )
+        .execute(&*self.pool)
+        .await
+        .with_context(|| "failed to ensure session_turns message index")?;
+
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_session_messages_seq
+            ON session_messages(session_id, message_seq);
+            "#,
+        )
+        .execute(&*self.pool)
+        .await
+        .with_context(|| "failed to ensure session_messages seq index")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_session_messages_time
+            ON session_messages(session_id, timestamp);
+            "#,
+        )
+        .execute(&*self.pool)
+        .await
+        .with_context(|| "failed to ensure session_messages time index")?;
 
         sqlx::query(
             r#"
@@ -872,6 +972,135 @@ impl Storage {
         Ok(total.max(0) as usize)
     }
 
+    pub async fn session_messages_count(&self, session_id: &str) -> Result<usize> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) AS total
+            FROM session_messages
+            WHERE session_id = ?
+            "#,
+        )
+        .bind(session_id)
+        .fetch_one(&*self.pool)
+        .await
+        .with_context(|| "failed to count session messages")?;
+
+        let total = row.try_get::<i64, _>("total").unwrap_or(0);
+        Ok(total.max(0) as usize)
+    }
+
+    pub async fn session_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                m.id,
+                m.timestamp,
+                m.snippet,
+                COUNT(t.id) AS turn_count,
+                COALESCE(SUM(t.prompt_tokens), 0) AS prompt_tokens,
+                COALESCE(SUM(t.cached_prompt_tokens), 0) AS cached_prompt_tokens,
+                COALESCE(SUM(t.completion_tokens), 0) AS completion_tokens,
+                COALESCE(SUM(t.total_tokens), 0) AS total_tokens,
+                COALESCE(SUM(t.reasoning_tokens), 0) AS reasoning_tokens,
+                COALESCE(SUM(t.cost_usd), 0.0) AS cost_usd,
+                COALESCE(SUM(t.missing_price), 0) AS missing_price
+            FROM session_messages m
+            LEFT JOIN session_turn_costs t
+              ON t.message_id = m.id
+            WHERE m.session_id = ?
+            GROUP BY m.id
+            ORDER BY m.message_seq DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(session_id)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&*self.pool)
+        .await
+        .with_context(|| "failed to load session messages")?;
+
+        let mut messages = Vec::with_capacity(rows.len());
+        for row in rows {
+            let timestamp_str: String = row.try_get("timestamp")?;
+            let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .with_context(|| "invalid timestamp in session_messages")?;
+            messages.push(SessionMessage {
+                id: row.try_get::<i64, _>("id")?,
+                timestamp,
+                snippet: row.try_get::<String, _>("snippet")?,
+                turn_count: row.try_get::<i64, _>("turn_count").unwrap_or(0) as u64,
+                prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+                cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0)
+                    as u64,
+                completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
+                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+                reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
+                cost_usd: cost_from_row(&row),
+            });
+        }
+
+        Ok(messages)
+    }
+
+    pub async fn session_unattributed_message(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionMessage>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                MAX(timestamp) AS timestamp,
+                COUNT(*) AS turn_count,
+                COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                COALESCE(SUM(cached_prompt_tokens), 0) AS cached_prompt_tokens,
+                COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+                COALESCE(SUM(cost_usd), 0.0) AS cost_usd,
+                COALESCE(SUM(missing_price), 0) AS missing_price
+            FROM session_turn_costs
+            WHERE session_id = ?
+              AND message_id IS NULL
+            "#,
+        )
+        .bind(session_id)
+        .fetch_one(&*self.pool)
+        .await
+        .with_context(|| "failed to load unattributed message summary")?;
+
+        let turn_count = row.try_get::<i64, _>("turn_count").unwrap_or(0);
+        if turn_count <= 0 {
+            return Ok(None);
+        }
+
+        let timestamp_str: Option<String> = row.try_get("timestamp").ok();
+        let timestamp_str = match timestamp_str {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .with_context(|| "invalid timestamp in unattributed message")?;
+
+        Ok(Some(SessionMessage {
+            id: 0,
+            timestamp,
+            snippet: "Unattributed turns".to_string(),
+            turn_count: turn_count as u64,
+            prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+            cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0) as u64,
+            completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
+            total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+            reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
+            cost_usd: cost_from_row(&row),
+        }))
+    }
+
     pub async fn session_turn_totals(&self, session_id: &str) -> Result<AggregateTotals> {
         let row = sqlx::query(
             r#"
@@ -1056,6 +1285,34 @@ impl Storage {
         })
     }
 
+    pub async fn counts_between_timestamps(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<PeriodCounts> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                (SELECT COUNT(DISTINCT session_id)
+                 FROM session_turns
+                 WHERE timestamp >= ?1 AND timestamp < ?2) AS session_count,
+                (SELECT COUNT(*)
+                 FROM session_messages
+                 WHERE timestamp >= ?1 AND timestamp < ?2) AS message_count
+            "#,
+        )
+        .bind(start.to_rfc3339())
+        .bind(end.to_rfc3339())
+        .fetch_one(&*self.pool)
+        .await
+        .with_context(|| "failed to load counts between timestamps")?;
+
+        Ok(PeriodCounts {
+            session_count: row.try_get::<i64, _>("session_count").unwrap_or(0) as u64,
+            message_count: row.try_get::<i64, _>("message_count").unwrap_or(0) as u64,
+        })
+    }
+
     pub async fn aggregates_by_bucket(
         &self,
         start: DateTime<Utc>,
@@ -1209,6 +1466,7 @@ impl Storage {
                     completion_tokens,
                     total_tokens,
                     reasoning_tokens,
+                    user_messages,
                     title,
                     last_summary
                 FROM sessions
@@ -1237,6 +1495,7 @@ impl Storage {
                 r.completion_tokens,
                 r.total_tokens,
                 r.reasoning_tokens,
+                r.user_messages,
                 r.title,
                 r.last_summary,
                 session_costs.cost_usd,
@@ -1274,6 +1533,7 @@ impl Storage {
                 completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
                 total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
                 reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
+                user_messages: row.try_get::<i64, _>("user_messages").unwrap_or(0) as u64,
                 cost_usd: cost_from_row(&row),
                 title: row.try_get::<Option<String>, _>("title")?,
                 last_summary: row.try_get::<Option<String>, _>("last_summary")?,
@@ -1322,6 +1582,7 @@ impl Storage {
                 s.completion_tokens,
                 s.total_tokens,
                 s.reasoning_tokens,
+                s.user_messages,
                 s.title,
                 s.last_summary,
                 session_costs.cost_usd,
@@ -1365,6 +1626,7 @@ impl Storage {
                 completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
                 total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
                 reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
+                user_messages: row.try_get::<i64, _>("user_messages").unwrap_or(0) as u64,
                 cost_usd: cost_from_row(&row),
                 title: row.try_get::<Option<String>, _>("title")?,
                 last_summary: row.try_get::<Option<String>, _>("last_summary")?,
@@ -1374,55 +1636,52 @@ impl Storage {
         Ok(aggregates)
     }
 
-    pub async fn session_turns(&self, session_id: &str, limit: usize) -> Result<Vec<SessionTurn>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT timestamp, model, note, context_window, reasoning_effort,
-                   prompt_tokens, cached_prompt_tokens, completion_tokens,
-                   total_tokens, reasoning_tokens,
-                   cost_usd, missing_price
-            FROM session_turn_costs
-            WHERE session_id = ?
-            ORDER BY timestamp DESC
-            LIMIT ?
-            "#,
-        )
-        .bind(session_id)
-        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(&*self.pool)
-        .await
-        .with_context(|| "failed to load session turns")?;
+    pub async fn session_turns_for_message(
+        &self,
+        session_id: &str,
+        message_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<SessionTurn>> {
+        let rows = if let Some(message_id) = message_id.filter(|value| *value > 0) {
+            sqlx::query(
+                r#"
+                SELECT timestamp, model, note, context_window, reasoning_effort,
+                       prompt_tokens, cached_prompt_tokens, completion_tokens,
+                       total_tokens, reasoning_tokens,
+                       cost_usd, missing_price
+                FROM session_turn_costs
+                WHERE message_id = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(message_id)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&*self.pool)
+            .await
+            .with_context(|| "failed to load message turns")?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT timestamp, model, note, context_window, reasoning_effort,
+                       prompt_tokens, cached_prompt_tokens, completion_tokens,
+                       total_tokens, reasoning_tokens,
+                       cost_usd, missing_price
+                FROM session_turn_costs
+                WHERE session_id = ?
+                  AND message_id IS NULL
+                ORDER BY timestamp DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(session_id)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&*self.pool)
+            .await
+            .with_context(|| "failed to load unattributed turns")?
+        };
 
-        let mut turns = Vec::with_capacity(rows.len());
-        for (idx, row) in rows.into_iter().enumerate() {
-            let timestamp_str: String = row.try_get("timestamp")?;
-            let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .with_context(|| "invalid timestamp in session_turns")?;
-
-            turns.push(SessionTurn {
-                turn_index: idx as u32 + 1,
-                timestamp,
-                model: row.try_get::<String, _>("model")?,
-                note: row.try_get::<Option<String>, _>("note")?,
-                context_window: row
-                    .try_get::<Option<i64>, _>("context_window")
-                    .ok()
-                    .flatten()
-                    .and_then(|value| u64::try_from(value).ok()),
-                reasoning_effort: row.try_get::<Option<String>, _>("reasoning_effort")?,
-                prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
-                cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0)
-                    as u64,
-                completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
-                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
-                reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
-                cost_usd: cost_from_row(&row),
-                usage_included: true,
-            });
-        }
-
-        Ok(turns)
+        map_session_turn_rows(rows, "message turns")
     }
 
     pub async fn upsert_session_meta(&self, meta: &SessionMeta) -> Result<()> {
@@ -1518,6 +1777,87 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn record_user_message(
+        &self,
+        session_id: &str,
+        timestamp: DateTime<Utc>,
+        snippet: &str,
+        message_seq: u64,
+    ) -> Result<i64> {
+        let timestamp_str = timestamp.to_rfc3339();
+        let message_seq = i64::try_from(message_seq).unwrap_or(i64::MAX);
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO sessions (
+                session_id, started_at, last_event_at,
+                prompt_tokens, cached_prompt_tokens, completion_tokens,
+                reasoning_tokens, total_tokens, user_messages
+            ) VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0)
+            ON CONFLICT(session_id) DO UPDATE SET
+                last_event_at = MAX(sessions.last_event_at, excluded.last_event_at)
+            "#,
+        )
+        .bind(session_id)
+        .bind(&timestamp_str)
+        .bind(&timestamp_str)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| "failed to ensure session row for message")?;
+
+        let insert_result = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO session_messages (
+                session_id, timestamp, role, snippet, message_seq
+            ) VALUES (?, ?, 'user', ?, ?)
+            "#,
+        )
+        .bind(session_id)
+        .bind(&timestamp_str)
+        .bind(snippet)
+        .bind(message_seq)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| "failed to insert session message")?;
+
+        let message_id = if insert_result.rows_affected() > 0 {
+            sqlx::query(
+                r#"
+                UPDATE sessions
+                SET user_messages = user_messages + 1,
+                    last_event_at = MAX(last_event_at, ?)
+                WHERE session_id = ?
+                "#,
+            )
+            .bind(&timestamp_str)
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| "failed to update session message count")?;
+
+            insert_result.last_insert_rowid()
+        } else {
+            let existing: Option<i64> = sqlx::query_scalar(
+                r#"
+                SELECT id
+                FROM session_messages
+                WHERE session_id = ? AND message_seq = ?
+                "#,
+            )
+            .bind(session_id)
+            .bind(message_seq)
+            .fetch_optional(&mut *tx)
+            .await
+            .with_context(|| "failed to load existing message id")?;
+            existing.unwrap_or(0)
+        };
+
+        tx.commit().await?;
+        Ok(message_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_turn(
         &self,
         session_id: &str,
@@ -1531,6 +1871,7 @@ impl Storage {
         completion_tokens: u64,
         reasoning_tokens: u64,
         total_tokens: u64,
+        message_id: Option<i64>,
     ) -> Result<()> {
         let date = timestamp.date_naive();
         let timestamp_str = timestamp.to_rfc3339();
@@ -1540,6 +1881,7 @@ impl Storage {
         let reasoning_tokens = i64::try_from(reasoning_tokens).unwrap_or(i64::MAX);
         let total_tokens = i64::try_from(total_tokens).unwrap_or(i64::MAX);
         let context_window = context_window.and_then(|value| i64::try_from(value).ok());
+        let message_id = message_id.and_then(|value| if value > 0 { Some(value) } else { None });
         let mut tx = self.pool.begin().await?;
 
         self.ensure_model_price_tx(&mut tx, model).await?;
@@ -1592,14 +1934,19 @@ impl Storage {
         .with_context(|| "failed to check for duplicate session turn")?;
 
         if duplicate.is_some() {
-            if note.is_some() || context_window.is_some() || reasoning_effort.is_some() {
+            if note.is_some()
+                || context_window.is_some()
+                || reasoning_effort.is_some()
+                || message_id.is_some()
+            {
                 sqlx::query(
                     r#"
                     UPDATE session_turns
                     SET
                         note = COALESCE(note, ?),
                         context_window = COALESCE(context_window, ?),
-                        reasoning_effort = COALESCE(reasoning_effort, ?)
+                        reasoning_effort = COALESCE(reasoning_effort, ?),
+                        message_id = COALESCE(message_id, ?)
                     WHERE session_id = ?
                       AND timestamp = ?
                       AND model = ?
@@ -1613,6 +1960,7 @@ impl Storage {
                 .bind(note)
                 .bind(context_window)
                 .bind(reasoning_effort)
+                .bind(message_id)
                 .bind(session_id)
                 .bind(&timestamp_str)
                 .bind(model)
@@ -1632,9 +1980,9 @@ impl Storage {
         let insert_result = sqlx::query(
             r#"
             INSERT OR IGNORE INTO session_turns (
-                session_id, timestamp, model, note, context_window, reasoning_effort, prompt_tokens,
+                session_id, timestamp, model, note, context_window, reasoning_effort, message_id, prompt_tokens,
                 cached_prompt_tokens, completion_tokens, reasoning_tokens, total_tokens
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(session_id)
@@ -1643,6 +1991,7 @@ impl Storage {
         .bind(note)
         .bind(context_window)
         .bind(reasoning_effort)
+        .bind(message_id)
         .bind(prompt_tokens)
         .bind(cached_prompt_tokens)
         .bind(completion_tokens)
@@ -1655,14 +2004,19 @@ impl Storage {
         let inserted = insert_result.rows_affected() > 0;
 
         if !inserted {
-            if note.is_some() || context_window.is_some() || reasoning_effort.is_some() {
+            if note.is_some()
+                || context_window.is_some()
+                || reasoning_effort.is_some()
+                || message_id.is_some()
+            {
                 sqlx::query(
                     r#"
                     UPDATE session_turns
                     SET
                         note = COALESCE(note, ?),
                         context_window = COALESCE(context_window, ?),
-                        reasoning_effort = COALESCE(reasoning_effort, ?)
+                        reasoning_effort = COALESCE(reasoning_effort, ?),
+                        message_id = COALESCE(message_id, ?)
                     WHERE session_id = ?
                       AND timestamp = ?
                       AND model = ?
@@ -1676,6 +2030,7 @@ impl Storage {
                 .bind(note)
                 .bind(context_window)
                 .bind(reasoning_effort)
+                .bind(message_id)
                 .bind(session_id)
                 .bind(&timestamp_str)
                 .bind(model)
@@ -1850,6 +2205,7 @@ impl Storage {
                    last_seen_total_tokens, last_committed_input_tokens,
                    last_committed_cached_input_tokens, last_committed_output_tokens,
                    last_committed_reasoning_output_tokens, last_committed_total_tokens,
+                   current_message_id, current_message_seq,
                    current_model, current_effort
             FROM ingest_state
             "#,
@@ -1892,6 +2248,9 @@ impl Storage {
                 last_committed_total_tokens: row
                     .try_get::<i64, _>("last_committed_total_tokens")
                     .unwrap_or(0) as u64,
+                current_message_id: row.try_get::<Option<i64>, _>("current_message_id")?,
+                current_message_seq: row.try_get::<i64, _>("current_message_seq").unwrap_or(0)
+                    as u64,
                 current_model: row.try_get::<Option<String>, _>("current_model")?,
                 current_effort: row.try_get::<Option<String>, _>("current_effort")?,
             });
@@ -1910,8 +2269,9 @@ impl Storage {
                 last_seen_total_tokens, last_committed_input_tokens,
                 last_committed_cached_input_tokens, last_committed_output_tokens,
                 last_committed_reasoning_output_tokens, last_committed_total_tokens,
+                current_message_id, current_message_seq,
                 current_model, current_effort
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 session_id = excluded.session_id,
                 last_offset = excluded.last_offset,
@@ -1925,6 +2285,8 @@ impl Storage {
                 last_committed_output_tokens = excluded.last_committed_output_tokens,
                 last_committed_reasoning_output_tokens = excluded.last_committed_reasoning_output_tokens,
                 last_committed_total_tokens = excluded.last_committed_total_tokens,
+                current_message_id = excluded.current_message_id,
+                current_message_seq = excluded.current_message_seq,
                 current_model = excluded.current_model,
                 current_effort = excluded.current_effort
             "#,
@@ -1942,6 +2304,8 @@ impl Storage {
         .bind(i64::try_from(state.last_committed_output_tokens).unwrap_or(i64::MAX))
         .bind(i64::try_from(state.last_committed_reasoning_output_tokens).unwrap_or(i64::MAX))
         .bind(i64::try_from(state.last_committed_total_tokens).unwrap_or(i64::MAX))
+        .bind(state.current_message_id)
+        .bind(i64::try_from(state.current_message_seq).unwrap_or(i64::MAX))
         .bind(state.current_model.as_deref())
         .bind(state.current_effort.as_deref())
         .execute(&*self.pool)
@@ -2021,6 +2385,7 @@ pub struct SessionAggregate {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub reasoning_tokens: u64,
+    pub user_messages: u64,
     pub cost_usd: Option<f64>,
     pub title: Option<String>,
     pub last_summary: Option<String>,
@@ -2055,6 +2420,20 @@ pub struct SessionTurn {
 }
 
 #[derive(Debug, Clone)]
+pub struct SessionMessage {
+    pub id: i64,
+    pub timestamp: DateTime<Utc>,
+    pub snippet: String,
+    pub turn_count: u64,
+    pub prompt_tokens: u64,
+    pub cached_prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelUsageRow {
     pub model: String,
     pub reasoning_effort: Option<String>,
@@ -2068,6 +2447,16 @@ pub struct ToolCountRow {
 }
 
 impl SessionTurn {
+    pub fn blended_total(&self) -> u64 {
+        blended_total(
+            self.prompt_tokens,
+            self.cached_prompt_tokens,
+            self.completion_tokens,
+        )
+    }
+}
+
+impl SessionMessage {
     pub fn blended_total(&self) -> u64 {
         blended_total(
             self.prompt_tokens,
@@ -2116,6 +2505,12 @@ pub struct BucketTotals {
 }
 
 #[derive(Debug, Clone)]
+pub struct PeriodCounts {
+    pub session_count: u64,
+    pub message_count: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct TopModelShare {
     pub model: String,
     pub reasoning_effort: Option<String>,
@@ -2157,8 +2552,42 @@ pub struct IngestStateRow {
     pub last_committed_output_tokens: u64,
     pub last_committed_reasoning_output_tokens: u64,
     pub last_committed_total_tokens: u64,
+    pub current_message_id: Option<i64>,
+    pub current_message_seq: u64,
     pub current_model: Option<String>,
     pub current_effort: Option<String>,
+}
+
+fn map_session_turn_rows(rows: Vec<SqliteRow>, label: &str) -> Result<Vec<SessionTurn>> {
+    let mut turns = Vec::with_capacity(rows.len());
+    for (idx, row) in rows.into_iter().enumerate() {
+        let timestamp_str: String = row.try_get("timestamp")?;
+        let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .with_context(|| format!("invalid timestamp in {label}"))?;
+
+        turns.push(SessionTurn {
+            turn_index: idx as u32 + 1,
+            timestamp,
+            model: row.try_get::<String, _>("model")?,
+            note: row.try_get::<Option<String>, _>("note")?,
+            context_window: row
+                .try_get::<Option<i64>, _>("context_window")
+                .ok()
+                .flatten()
+                .and_then(|value| u64::try_from(value).ok()),
+            reasoning_effort: row.try_get::<Option<String>, _>("reasoning_effort")?,
+            prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+            cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0) as u64,
+            completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
+            total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+            reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
+            cost_usd: cost_from_row(&row),
+            usage_included: true,
+        });
+    }
+
+    Ok(turns)
 }
 
 fn cost_from_row(row: &SqliteRow) -> Option<f64> {
@@ -2173,7 +2602,7 @@ fn cost_from_row(row: &SqliteRow) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration as ChronoDuration;
+    use chrono::{Duration as ChronoDuration, TimeZone};
     use tempfile::NamedTempFile;
 
     async fn seed_price(
@@ -2227,7 +2656,7 @@ mod tests {
         storage
             .record_turn(
                 "sess-1", ts, "gpt-test", None, None, None, 1_000_000, 200_000, 300_000, 50_000,
-                1_300_000,
+                1_300_000, None,
             )
             .await
             .unwrap();
@@ -2271,6 +2700,7 @@ mod tests {
                 50_000,
                 0,
                 150_000,
+                None,
             )
             .await
             .unwrap();
@@ -2287,6 +2717,7 @@ mod tests {
                 50_000,
                 0,
                 350_000,
+                None,
             )
             .await
             .unwrap();
