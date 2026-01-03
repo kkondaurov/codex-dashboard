@@ -55,6 +55,15 @@ const HEATMAP_COLORS: [Color; 7] = [
     Color::Rgb(130, 205, 145),
     Color::Rgb(155, 230, 170),
 ];
+const MODEL_BAR_COLORS: [Color; 7] = [
+    Color::Rgb(28, 28, 28),
+    Color::Rgb(0, 70, 70),
+    Color::Rgb(0, 95, 95),
+    Color::Rgb(0, 120, 120),
+    Color::Rgb(0, 150, 150),
+    Color::Rgb(0, 180, 180),
+    Color::Rgb(0, 210, 210),
+];
 const FUTURE_HEATMAP_COLOR: Color = Color::Rgb(22, 22, 22);
 const STREAK_COLORS: [Color; 7] = [
     Color::Rgb(35, 35, 35),
@@ -1373,6 +1382,8 @@ fn render_wrapped_top_models(frame: &mut Frame, area: Rect, stats: &WrappedStats
             } else {
                 String::new()
             };
+            let intensity = heatmap_intensity((model.share * 1000.0).round() as u64, 1000);
+            let bar_color = MODEL_BAR_COLORS[intensity];
             let line = Line::from(vec![
                 Span::styled(label, Style::default().fg(theme.text_fg)),
                 Span::raw("  "),
@@ -1386,7 +1397,7 @@ fn render_wrapped_top_models(frame: &mut Frame, area: Rect, stats: &WrappedStats
                 } else {
                     Span::raw("")
                 },
-                Span::styled(bar, Style::default().fg(theme.header_fg)),
+                Span::styled(bar, Style::default().fg(bar_color)),
             ]);
             lines.push(line);
         }
