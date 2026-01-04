@@ -302,6 +302,8 @@ impl SessionIngestor {
             return Ok(());
         }
 
+        let mut tx = self.storage.begin_tx().await?;
+
         for line in lines {
             if line.trim().is_empty() {
                 continue;
@@ -309,20 +311,29 @@ impl SessionIngestor {
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            if let Err(err) = process_event(&self.storage, &mut state, &value).await {
+            if let Err(err) = process_event(&self.storage, &mut tx, &mut state, &value).await {
                 tracing::warn!(error = %err, path = %path.display(), "failed to process session event");
             }
         }
 
         state.last_offset = new_offset;
         let ingest_state = state.to_state_row(path);
-        self.storage.upsert_ingest_state(&ingest_state).await?;
+        self.storage
+            .update_ingest_activity_tx(&mut tx, Utc::now())
+            .await?;
+        self.storage.upsert_ingest_state_tx(&mut tx, &ingest_state).await?;
+        tx.commit().await?;
         self.files.insert(path.to_path_buf(), state);
         Ok(())
     }
 }
 
-async fn process_event(storage: &Storage, state: &mut FileState, value: &Value) -> Result<()> {
+async fn process_event(
+    storage: &Storage,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    state: &mut FileState,
+    value: &Value,
+) -> Result<()> {
     let Some(kind) = value.get("type").and_then(|v| v.as_str()) else {
         return Ok(());
     };
@@ -335,19 +346,25 @@ async fn process_event(storage: &Storage, state: &mut FileState, value: &Value) 
         "session_meta" => {
             if let Some(meta) = parse_session_meta(value, timestamp) {
                 state.session_id = Some(meta.session_id.clone());
-                storage.upsert_session_meta(&meta).await?;
+                storage.upsert_session_meta_tx(tx, &meta).await?;
                 if let Some(title) = state.pending_title.take() {
                     storage
-                        .set_session_title_if_empty(&meta.session_id, &title)
+                        .set_session_title_if_empty_tx(tx, &meta.session_id, &title)
                         .await?;
                 }
                 if let Some(summary) = state.pending_summary.take() {
                     storage
-                        .set_session_summary(&meta.session_id, &summary, meta.last_event_at)
+                        .set_session_summary_tx(tx, &meta.session_id, &summary, meta.last_event_at)
                         .await?;
                 }
                 if !state.pending_messages.is_empty() {
-                    flush_pending_messages(storage, state, &meta.session_id, meta.last_event_at)
+                    flush_pending_messages(
+                        storage,
+                        tx,
+                        state,
+                        &meta.session_id,
+                        meta.last_event_at,
+                    )
                         .await?;
                 }
             }
@@ -369,17 +386,17 @@ async fn process_event(storage: &Storage, state: &mut FileState, value: &Value) 
             if let Some(payload) = value.get("payload") {
                 match payload.get("type").and_then(|v| v.as_str()) {
                     Some("token_count") => {
-                        handle_token_count(storage, state, payload, timestamp).await?;
+                        handle_token_count(storage, tx, state, payload, timestamp).await?;
                     }
                     Some("user_message") => {
                         if let Some(message) = payload.get("message").and_then(|v| v.as_str()) {
-                            handle_user_message(storage, state, message, timestamp).await?;
+                            handle_user_message(storage, tx, state, message, timestamp).await?;
                         }
                     }
                     Some("agent_message") => {
                         if let Some(message) = payload.get("message").and_then(|v| v.as_str()) {
                             if let Some(summary) = format_snippet(message, SUMMARY_MAX_CHARS) {
-                                apply_summary(storage, state, &summary, timestamp).await?;
+                                apply_summary(storage, tx, state, &summary, timestamp).await?;
                             }
                             if let Some(note) = format_snippet(message, SUMMARY_MAX_CHARS) {
                                 state.pending_note = Some(note);
@@ -407,10 +424,10 @@ async fn process_event(storage: &Storage, state: &mut FileState, value: &Value) 
                             && let Some(text) = extract_message_text(payload)
                         {
                             if role.eq_ignore_ascii_case("user") {
-                                handle_user_message(storage, state, &text, timestamp).await?;
+                                handle_user_message(storage, tx, state, &text, timestamp).await?;
                             } else if role.eq_ignore_ascii_case("assistant") {
                                 if let Some(summary) = format_snippet(&text, SUMMARY_MAX_CHARS) {
-                                    apply_summary(storage, state, &summary, timestamp).await?;
+                                    apply_summary(storage, tx, state, &summary, timestamp).await?;
                                 }
                                 if let Some(note) = format_snippet(&text, SUMMARY_MAX_CHARS) {
                                     state.pending_note = Some(note);
@@ -426,7 +443,7 @@ async fn process_event(storage: &Storage, state: &mut FileState, value: &Value) 
                             state.pending_note_seq = state.pending_note_seq.saturating_add(1);
                         }
                         if let Some(name) = payload.get("name").and_then(|v| v.as_str()) {
-                            record_tool_event(storage, state, timestamp, name).await?;
+                            record_tool_event(storage, tx, state, timestamp, name).await?;
                         }
                     }
                     Some("web_search_call") => {
@@ -434,7 +451,7 @@ async fn process_event(storage: &Storage, state: &mut FileState, value: &Value) 
                             state.pending_note = Some(note);
                             state.pending_note_seq = state.pending_note_seq.saturating_add(1);
                         }
-                        record_tool_event(storage, state, timestamp, "web_search").await?;
+                        record_tool_event(storage, tx, state, timestamp, "web_search").await?;
                     }
                     Some("local_shell_call") => {
                         if let Some(action_type) = payload
@@ -442,9 +459,9 @@ async fn process_event(storage: &Storage, state: &mut FileState, value: &Value) 
                             .and_then(|v| v.get("type"))
                             .and_then(|v| v.as_str())
                         {
-                            record_tool_event(storage, state, timestamp, action_type).await?;
+                            record_tool_event(storage, tx, state, timestamp, action_type).await?;
                         } else {
-                            record_tool_event(storage, state, timestamp, "local_shell").await?;
+                            record_tool_event(storage, tx, state, timestamp, "local_shell").await?;
                         }
                     }
                     Some("reasoning") => {
@@ -463,16 +480,24 @@ async fn process_event(storage: &Storage, state: &mut FileState, value: &Value) 
     Ok(())
 }
 
-async fn apply_title(storage: &Storage, state: &mut FileState, title: &str) -> Result<()> {
+async fn apply_title(
+    storage: &Storage,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    state: &mut FileState,
+    title: &str,
+) -> Result<()> {
     let Some(session_id) = state.session_id.as_deref() else {
         state.pending_title = Some(title.to_string());
         return Ok(());
     };
-    storage.set_session_title_if_empty(session_id, title).await
+    storage
+        .set_session_title_if_empty_tx(tx, session_id, title)
+        .await
 }
 
 async fn apply_summary(
     storage: &Storage,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     state: &mut FileState,
     summary: &str,
     timestamp: Option<DateTime<Utc>>,
@@ -482,14 +507,19 @@ async fn apply_summary(
         return Ok(());
     };
     if let Some(ts) = timestamp {
-        storage.set_session_summary(session_id, summary, ts).await
+        storage
+            .set_session_summary_tx(tx, session_id, summary, ts)
+            .await
     } else {
-        storage.set_session_summary_only(session_id, summary).await
+        storage
+            .set_session_summary_only_tx(tx, session_id, summary)
+            .await
     }
 }
 
 async fn handle_user_message(
     storage: &Storage,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     state: &mut FileState,
     message: &str,
     timestamp: Option<DateTime<Utc>>,
@@ -505,12 +535,12 @@ async fn handle_user_message(
     state.current_message_seq = state.current_message_seq.saturating_add(1);
     let seq = state.current_message_seq;
 
-    apply_title(storage, state, &snippet).await?;
+    apply_title(storage, tx, state, &snippet).await?;
 
     if let Some(session_id) = state.session_id.as_deref() {
         let ts = timestamp.unwrap_or_else(Utc::now);
         let message_id = storage
-            .record_user_message(session_id, ts, &snippet, seq)
+            .record_user_message_tx(tx, session_id, ts, &snippet, seq)
             .await?;
         state.current_message_id = (message_id > 0).then_some(message_id);
     } else {
@@ -528,6 +558,7 @@ async fn handle_user_message(
 
 async fn flush_pending_messages(
     storage: &Storage,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     state: &mut FileState,
     session_id: &str,
     fallback_timestamp: DateTime<Utc>,
@@ -537,7 +568,7 @@ async fn flush_pending_messages(
     for message in pending {
         let ts = message.timestamp.unwrap_or(fallback_timestamp);
         let message_id = storage
-            .record_user_message(session_id, ts, &message.snippet, message.seq)
+            .record_user_message_tx(tx, session_id, ts, &message.snippet, message.seq)
             .await?;
         if message_id > 0 {
             latest_id = Some(message_id);
@@ -569,6 +600,7 @@ fn should_skip_duplicate_message(
 
 async fn handle_token_count(
     storage: &Storage,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     state: &mut FileState,
     payload: &Value,
     timestamp: Option<DateTime<Utc>>,
@@ -626,7 +658,8 @@ async fn handle_token_count(
         None
     };
     storage
-        .record_turn(
+        .record_turn_tx(
+            tx,
             session_id,
             ts,
             model,
@@ -930,6 +963,7 @@ fn format_reasoning_note(text: &str) -> String {
 
 async fn record_tool_event(
     storage: &Storage,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     state: &FileState,
     timestamp: Option<DateTime<Utc>>,
     tool_name: &str,
@@ -940,7 +974,7 @@ async fn record_tool_event(
     let Some(ts) = timestamp else {
         return Ok(());
     };
-    storage.record_tool_call(session_id, ts, tool_name).await
+    storage.record_tool_call_tx(tx, session_id, ts, tool_name).await
 }
 
 impl PartialEq for TokenTotals {

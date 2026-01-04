@@ -217,27 +217,33 @@ impl TimeNavState {
 struct UiDataCache {
     hero: HeroStats,
     hero_last: Option<Instant>,
+    hero_day: Option<NaiveDate>,
+    hero_ingest_at: Option<DateTime<Utc>>,
     sessions_rows: Vec<SessionAggregate>,
     sessions_total: usize,
     sessions_offset: usize,
     sessions_limit: usize,
     sessions_last: Option<Instant>,
     sessions_key: Option<(TimeRange, NaiveDate, SessionSort)>,
+    sessions_ingest_at: Option<DateTime<Utc>>,
     stats_data: Option<StatsRangeData>,
     stats_last: Option<Instant>,
     stats_key: Option<(TimeRange, NaiveDate)>,
+    stats_ingest_at: Option<DateTime<Utc>>,
     pricing_rows: Vec<PriceRow>,
     pricing_missing: Vec<MissingPriceDetail>,
     pricing_meta: Option<PricingMeta>,
     pricing_last: Option<Instant>,
     missing_last: Option<Instant>,
     last_ingest: Option<DateTime<Utc>>,
+    last_event: Option<DateTime<Utc>>,
     ingest_last: Option<Instant>,
     ingest_flash: Option<Instant>,
     wrapped_data: Option<WrappedStats>,
     wrapped_year: Option<i32>,
     wrapped_last: Option<Instant>,
     wrapped_ingest_at: Option<DateTime<Utc>>,
+    wrapped_day: Option<NaiveDate>,
     modal_messages: Vec<SessionMessage>,
     modal_message_total: usize,
     modal_unattributed: Option<SessionMessage>,
@@ -257,27 +263,33 @@ impl UiDataCache {
         Self {
             hero: HeroStats::default(),
             hero_last: None,
+            hero_day: None,
+            hero_ingest_at: None,
             sessions_rows: Vec::new(),
             sessions_total: 0,
             sessions_offset: 0,
             sessions_limit: 0,
             sessions_last: None,
             sessions_key: None,
+            sessions_ingest_at: None,
             stats_data: None,
             stats_last: None,
             stats_key: None,
+            stats_ingest_at: None,
             pricing_rows: Vec::new(),
             pricing_missing: Vec::new(),
             pricing_meta: None,
             pricing_last: None,
             missing_last: None,
             last_ingest: None,
+            last_event: None,
             ingest_last: None,
             ingest_flash: None,
             wrapped_data: None,
             wrapped_year: None,
             wrapped_last: None,
             wrapped_ingest_at: None,
+            wrapped_day: None,
             modal_messages: Vec::new(),
             modal_message_total: 0,
             modal_unattributed: None,
@@ -296,6 +308,13 @@ impl UiDataCache {
     fn should_refresh(last: Option<Instant>, interval: Duration, now: Instant) -> bool {
         last.map(|at| now.duration_since(at) >= interval)
             .unwrap_or(true)
+    }
+
+    fn ingest_active(&self, now: Instant) -> bool {
+        self.ingest_flash
+            .and_then(|instant| now.checked_duration_since(instant))
+            .map(|elapsed| elapsed <= Duration::from_secs(5))
+            .unwrap_or(false)
     }
 
     fn invalidate_for_view(&mut self, view: ViewMode) {
@@ -325,12 +344,29 @@ impl UiDataCache {
         storage: &Storage,
         alerts: &AlertSettings,
     ) {
-        if Self::should_refresh(self.hero_last, SUMMARY_REFRESH_INTERVAL, now) {
-            match runtime.block_on(HeroStats::gather(storage, today, alerts)) {
-                Ok(stats) => self.hero = stats,
-                Err(err) => tracing::warn!(error = %err, "failed to gather hero stats"),
+        let ingest_changed = self.last_ingest.is_some() && self.hero_ingest_at != self.last_ingest;
+        let day_changed = self.hero_day != Some(today);
+        let needs_refresh = self.hero_last.is_none() || ingest_changed || day_changed;
+
+        if !needs_refresh {
+            return;
+        }
+        if !Self::should_refresh(self.hero_last, SUMMARY_REFRESH_INTERVAL, now) && !day_changed {
+            return;
+        }
+
+        let mut updated = false;
+        match runtime.block_on(HeroStats::gather(storage, today, alerts)) {
+            Ok(stats) => {
+                self.hero = stats;
+                updated = true;
             }
-            self.hero_last = Some(now);
+            Err(err) => tracing::warn!(error = %err, "failed to gather hero stats"),
+        }
+        self.hero_last = Some(now);
+        if updated {
+            self.hero_ingest_at = self.last_ingest;
+            self.hero_day = Some(today);
         }
     }
 
@@ -351,9 +387,13 @@ impl UiDataCache {
             view.reset();
         }
 
+        let ingest_changed =
+            self.last_ingest.is_some() && self.sessions_ingest_at != self.last_ingest;
         let refresh_due = Self::should_refresh(self.sessions_last, RECENT_REFRESH_INTERVAL, now);
+        let ingest_active = self.ingest_active(now);
+        let refresh_active = ingest_active && refresh_due;
         let period = period_for_range(view.nav.range, view.nav.anchor, now_local);
-        if refresh_due || self.sessions_total == 0 || key_changed {
+        if ingest_changed || self.sessions_total == 0 || key_changed || refresh_active {
             match runtime.block_on(storage.sessions_count_between(period.start, period.end)) {
                 Ok(total) => self.sessions_total = total,
                 Err(err) => tracing::warn!(error = %err, "failed to count sessions"),
@@ -363,15 +403,24 @@ impl UiDataCache {
         let (offset, limit) = sessions_window_for(view, self.sessions_total, max_limit);
         let window_changed = offset != self.sessions_offset || limit != self.sessions_limit;
 
-        if refresh_due || window_changed {
-            if self.sessions_total == 0 || limit == 0 {
-                self.sessions_rows.clear();
-                self.sessions_offset = 0;
-                self.sessions_limit = 0;
-                self.sessions_last = Some(now);
-                return;
-            }
+        if !(
+            ingest_changed
+                || key_changed
+                || window_changed
+                || self.sessions_last.is_none()
+                || refresh_active
+        ) {
+            return;
+        }
 
+        let mut updated = false;
+        if self.sessions_total == 0 || limit == 0 {
+            self.sessions_rows.clear();
+            self.sessions_offset = 0;
+            self.sessions_limit = 0;
+            self.sessions_last = Some(now);
+            updated = true;
+        } else {
             let result = match view.sort {
                 SessionSort::Recent => runtime.block_on(storage.sessions_page_by_recent_between(
                     period.start,
@@ -391,10 +440,15 @@ impl UiDataCache {
                     self.sessions_rows = rows;
                     self.sessions_offset = offset;
                     self.sessions_limit = limit;
+                    updated = true;
                 }
                 Err(err) => tracing::warn!(error = %err, "failed to load sessions page"),
             }
             self.sessions_last = Some(now);
+        }
+
+        if updated {
+            self.sessions_ingest_at = self.last_ingest;
         }
     }
 
@@ -413,13 +467,26 @@ impl UiDataCache {
             self.stats_key = Some(key);
             self.stats_last = None;
         }
-        if Self::should_refresh(self.stats_last, STATS_REFRESH_INTERVAL, now) {
-            let period = period_for_range(nav.range, nav.anchor, now_local);
-            match runtime.block_on(StatsRangeData::gather(storage, &period, nav.range, alerts)) {
-                Ok(breakdown) => self.stats_data = Some(breakdown),
-                Err(err) => tracing::warn!(error = %err, "failed to gather stats data"),
+        let ingest_changed = self.last_ingest.is_some() && self.stats_ingest_at != self.last_ingest;
+        let needs_refresh = self.stats_last.is_none() || key_changed || ingest_changed;
+        if !needs_refresh {
+            return;
+        }
+        if !Self::should_refresh(self.stats_last, STATS_REFRESH_INTERVAL, now) && !key_changed {
+            return;
+        }
+        let period = period_for_range(nav.range, nav.anchor, now_local);
+        let mut updated = false;
+        match runtime.block_on(StatsRangeData::gather(storage, &period, nav.range, alerts)) {
+            Ok(breakdown) => {
+                self.stats_data = Some(breakdown);
+                updated = true;
             }
-            self.stats_last = Some(now);
+            Err(err) => tracing::warn!(error = %err, "failed to gather stats data"),
+        }
+        self.stats_last = Some(now);
+        if updated {
+            self.stats_ingest_at = self.last_ingest;
         }
     }
 
@@ -435,18 +502,32 @@ impl UiDataCache {
         let year_changed = self.wrapped_year != Some(year);
         let ingest_changed =
             self.last_ingest.is_some() && self.wrapped_ingest_at != self.last_ingest;
-        let refresh_due = year_changed
-            || Self::should_refresh(self.wrapped_last, WRAPPED_REFRESH_INTERVAL, now)
-            || ingest_changed;
+        let day_changed = self.wrapped_day != Some(now_local.date_naive());
+        let needs_refresh =
+            self.wrapped_last.is_none() || year_changed || ingest_changed || day_changed;
 
-        if refresh_due {
+        if needs_refresh {
+            if !Self::should_refresh(self.wrapped_last, WRAPPED_REFRESH_INTERVAL, now)
+                && !year_changed
+                && !day_changed
+            {
+                return;
+            }
+
+            let mut updated = false;
             match runtime.block_on(WrappedStats::gather(storage, year, now_local)) {
-                Ok(stats) => self.wrapped_data = Some(stats),
+                Ok(stats) => {
+                    self.wrapped_data = Some(stats);
+                    updated = true;
+                }
                 Err(err) => tracing::warn!(error = %err, "failed to gather wrapped stats"),
             }
             self.wrapped_year = Some(year);
             self.wrapped_last = Some(now);
-            self.wrapped_ingest_at = self.last_ingest;
+            if updated {
+                self.wrapped_ingest_at = self.last_ingest;
+                self.wrapped_day = Some(now_local.date_naive());
+            }
         }
     }
 
@@ -482,12 +563,18 @@ impl UiDataCache {
     fn refresh_ingest(&mut self, now: Instant, runtime: &Handle, storage: &Storage) {
         if Self::should_refresh(self.ingest_last, SUMMARY_REFRESH_INTERVAL, now) {
             let previous = self.last_ingest;
-            match runtime.block_on(storage.last_ingest_timestamp()) {
+            match runtime.block_on(storage.last_ingest_activity()) {
                 Ok(value) => {
                     if value.is_some() && value != previous {
                         self.ingest_flash = Some(now);
                     }
                     self.last_ingest = value;
+                }
+                Err(err) => tracing::warn!(error = %err, "failed to load ingest activity"),
+            }
+            match runtime.block_on(storage.last_ingest_timestamp()) {
+                Ok(value) => {
+                    self.last_event = value;
                 }
                 Err(err) => tracing::warn!(error = %err, "failed to load last ingest timestamp"),
             }
@@ -904,6 +991,8 @@ fn draw_ui(
     cache: &UiDataCache,
 ) {
     let dim_background = session_modal.is_open() || missing_modal.is_open() || help_modal.is_open();
+    let now_instant = Instant::now();
+    let ingest_active = cache.ingest_active(now_instant);
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -930,6 +1019,7 @@ fn draw_ui(
             sessions_total,
             sessions_offset,
             sessions_view,
+            ingest_active,
             dim_background,
         ),
         ViewMode::Stats => {
@@ -949,7 +1039,7 @@ fn draw_ui(
     render_status_bar(
         frame,
         layout[2],
-        cache.last_ingest,
+        cache.last_event,
         cache.ingest_flash,
         cache.pricing_missing.len(),
         help_modal.is_open(),
@@ -1060,6 +1150,7 @@ fn draw_sessions_view(
     total: usize,
     offset: usize,
     view: &mut SessionsViewState,
+    ingest_active: bool,
     dim: bool,
 ) {
     let layout = Layout::default()
@@ -1072,7 +1163,16 @@ fn draw_sessions_view(
         .split(layout[0]);
     render_time_nav(frame, top_layout[0], &view.nav, dim);
     render_sort_nav(frame, top_layout[1], view.sort, dim);
-    render_sessions_table(frame, layout[1], sessions, total, offset, view, dim);
+    render_sessions_table(
+        frame,
+        layout[1],
+        sessions,
+        total,
+        offset,
+        view,
+        ingest_active,
+        dim,
+    );
 }
 
 fn draw_stats_view(
@@ -2256,7 +2356,7 @@ fn range_tab_spans(
 fn render_status_bar(
     frame: &mut Frame,
     area: Rect,
-    last_ingest: Option<DateTime<Utc>>,
+    last_event: Option<DateTime<Utc>>,
     ingest_flash: Option<Instant>,
     missing_count: usize,
     help_open: bool,
@@ -2265,7 +2365,7 @@ fn render_status_bar(
     let theme = ui_theme(dim);
     let now = Utc::now();
     let now_instant = Instant::now();
-    let age_label = match last_ingest {
+    let age_label = match last_event {
         Some(ts) => {
             let age = now.signed_duration_since(ts);
             let secs = age.num_seconds().max(0);
@@ -2279,13 +2379,20 @@ fn render_status_bar(
         }
         None => "—".to_string(),
     };
-    let ingest_text = format!("last update: {age_label}");
-    let ingest_color = ingest_flash
-        .and_then(|instant| now_instant.checked_duration_since(instant))
+    let ingest_elapsed = ingest_flash.and_then(|instant| now_instant.checked_duration_since(instant));
+    let ingest_active = ingest_elapsed
+        .map(|elapsed| elapsed <= Duration::from_secs(5))
+        .unwrap_or(false);
+    let ingest_state = if ingest_active { "busy" } else { "idle" };
+    let ingest_state = format!("{:<4}", ingest_state);
+    let ingest_text = format!("{ingest_state}  |  last event: {age_label}");
+    let ingest_color = ingest_elapsed
         .map(|elapsed| {
             if elapsed < Duration::from_millis(500) {
                 Color::Green
             } else if elapsed < Duration::from_millis(1100) {
+                Color::LightGreen
+            } else if elapsed <= Duration::from_secs(5) {
                 Color::LightGreen
             } else {
                 Color::DarkGray
@@ -2568,6 +2675,7 @@ fn render_sessions_table(
     total_sessions: usize,
     window_offset: usize,
     view: &mut SessionsViewState,
+    ingest_active: bool,
     dim: bool,
 ) {
     let theme = ui_theme(dim);
@@ -2575,8 +2683,9 @@ fn render_sessions_table(
     let visible_rows = visible_rows_for_table(area);
     view.list.set_visible_rows(visible_rows, total);
     let (page, pages) = view.list.page_info(total);
+    let status = if ingest_active { " (updating…)" } else { "" };
     let title = format!(
-        "Sessions – {total} total • page {page}/{pages} (↑/↓ PgUp/PgDn navigate, Enter details)"
+        "Sessions: {total} total{status} • page {page}/{pages} (↑/↓ PgUp/PgDn navigate, Enter details)"
     );
     let empty_state = if total > 0 && sessions.is_empty() {
         Some(EmptyState::Loading)

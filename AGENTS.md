@@ -27,16 +27,23 @@ This repository hosts a Rust-based local TUI that tracks OpenAI / Codex usage. T
 - Prefer fast, deterministic tests. Unit tests should not hit real OpenAI endpoints.
 - For code that talks to the network, introduce traits and test with fakes/mocks.
 - Name tests descriptively (`test_calculates_daily_costs`, not `test1`).
-- Ensure `cargo test` passes before opening a PR.
+- Ensure `cargo test` passes before reporting back to the user.
+
+## Your workflow
+- Before implementing anything, propose a plan, and get a good-to-go from the user.
+- Always consider test coverage of the planned, and add/update appropriate tests as part of the implementation.
+- When you're done with the implementation, rerun the test suite, and iteratively fix the problem flagged by failed tests.
+- Run `cargo check`, `cargo fmt`, and `cargo clippy` after finishing the implementation, and before reporting back to the user,
+  and iteratively fix the issues identified by these commands; don't forget to rerun the test suite.
 
 ## Commit & Pull Request Guidelines
 
 - Use clear, imperative commit messages: `Add daily aggregate storage`, `Fix TUI refresh bug`.
+- Use multi-line commit messages with concise description of the changes. Keep the first line brief but clear.
 - Commit messages should describe the change, mention user-visible behavior, and note any new config or migrations.
 - Escalate the permissions to do the commit, never attempt to do create or delete git lock file.
 - Only commit if and when explicitly instructed by the user.
 
 ## Security & Configuration Tips
 
-- Never log API keys or full request/response bodies by default; log only metadata needed for usage tracking.
 - Keep pricing and other secrets in config files or environment variables, not hard-coded into logic.

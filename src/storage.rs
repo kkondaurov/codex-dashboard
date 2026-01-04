@@ -1,11 +1,12 @@
 use crate::tokens::blended_total;
 use anyhow::{Context, Result};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Local, LocalResult, NaiveDate, Utc, Duration as ChronoDuration, TimeZone};
 use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
 };
 use std::{
+    collections::{HashMap, HashSet},
     convert::TryFrom,
     path::{Path, PathBuf},
     sync::Arc,
@@ -132,6 +133,13 @@ impl Storage {
             pool: Arc::new(pool),
             path: path_buf,
         })
+    }
+
+    pub async fn begin_tx(&self) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>> {
+        self.pool
+            .begin()
+            .await
+            .with_context(|| "failed to start sqlite transaction")
     }
 
     pub async fn ensure_schema(&self) -> Result<()> {
@@ -398,6 +406,18 @@ impl Storage {
 
         sqlx::query(
             r#"
+            CREATE TABLE IF NOT EXISTS stats_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                daily_stats_tz TEXT NOT NULL
+            );
+            "#,
+        )
+        .execute(&*self.pool)
+        .await
+        .with_context(|| "failed to ensure stats_meta schema")?;
+
+        sqlx::query(
+            r#"
             CREATE TABLE IF NOT EXISTS ingest_state (
                 path TEXT PRIMARY KEY,
                 session_id TEXT,
@@ -422,6 +442,18 @@ impl Storage {
         .execute(&*self.pool)
         .await
         .with_context(|| "failed to ensure ingest_state schema")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS ingest_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_ingest_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .execute(&*self.pool)
+        .await
+        .with_context(|| "failed to ensure ingest_meta schema")?;
 
         let has_current_effort = self
             .table_has_column("ingest_state", "current_effort")
@@ -561,6 +593,7 @@ impl Storage {
         .with_context(|| "failed to ensure daily_stats date index")?;
 
         self.ensure_turn_dedupe_index().await?;
+        self.ensure_daily_stats_basis().await?;
 
         Ok(())
     }
@@ -609,6 +642,93 @@ impl Storage {
             );
         }
 
+        Ok(())
+    }
+
+    async fn ensure_daily_stats_basis(&self) -> Result<()> {
+        let basis: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT daily_stats_tz
+            FROM stats_meta
+            WHERE id = 1
+            "#,
+        )
+        .fetch_optional(&*self.pool)
+        .await
+        .with_context(|| "failed to read stats_meta")?;
+
+        if basis.as_deref() == Some("local") {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM session_daily_stats;")
+            .execute(&mut *tx)
+            .await
+            .with_context(|| "failed to clear session_daily_stats for rebuild")?;
+        sqlx::query("DELETE FROM daily_stats;")
+            .execute(&mut *tx)
+            .await
+            .with_context(|| "failed to clear daily_stats for rebuild")?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO session_daily_stats (
+                date, session_id, model, prompt_tokens, cached_prompt_tokens,
+                completion_tokens, reasoning_tokens, total_tokens
+            )
+            SELECT
+                DATE(timestamp, 'localtime') AS date,
+                session_id,
+                model,
+                COALESCE(SUM(prompt_tokens), 0),
+                COALESCE(SUM(cached_prompt_tokens), 0),
+                COALESCE(SUM(completion_tokens), 0),
+                COALESCE(SUM(reasoning_tokens), 0),
+                COALESCE(SUM(total_tokens), 0)
+            FROM session_turns
+            GROUP BY date, session_id, model
+            "#,
+        )
+        .execute(&mut *tx)
+        .await
+        .with_context(|| "failed to rebuild session_daily_stats for local time")?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO daily_stats (
+                date, model, prompt_tokens, cached_prompt_tokens,
+                completion_tokens, reasoning_tokens, total_tokens
+            )
+            SELECT
+                DATE(timestamp, 'localtime') AS date,
+                model,
+                COALESCE(SUM(prompt_tokens), 0),
+                COALESCE(SUM(cached_prompt_tokens), 0),
+                COALESCE(SUM(completion_tokens), 0),
+                COALESCE(SUM(reasoning_tokens), 0),
+                COALESCE(SUM(total_tokens), 0)
+            FROM session_turns
+            GROUP BY date, model
+            "#,
+        )
+        .execute(&mut *tx)
+        .await
+        .with_context(|| "failed to rebuild daily_stats for local time")?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO stats_meta (id, daily_stats_tz)
+            VALUES (1, 'local')
+            ON CONFLICT(id) DO UPDATE SET
+                daily_stats_tz = excluded.daily_stats_tz
+            "#,
+        )
+        .execute(&mut *tx)
+        .await
+        .with_context(|| "failed to update stats_meta")?;
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -955,6 +1075,28 @@ impl Storage {
         Ok(parsed)
     }
 
+    pub async fn last_ingest_activity(&self) -> Result<Option<DateTime<Utc>>> {
+        let row: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT last_ingest_at
+            FROM ingest_meta
+            WHERE id = 1
+            "#,
+        )
+        .fetch_optional(&*self.pool)
+        .await
+        .with_context(|| "failed to load ingest activity timestamp")?;
+
+        let Some(value) = row else {
+            return Ok(None);
+        };
+
+        let parsed = DateTime::parse_from_rfc3339(&value)
+            .map(|dt| dt.with_timezone(&Utc))
+            .ok();
+        Ok(parsed)
+    }
+
     pub async fn session_turns_count(&self, session_id: &str) -> Result<usize> {
         let row = sqlx::query(
             r#"
@@ -1228,13 +1370,14 @@ impl Storage {
         Ok(result)
     }
 
-    pub async fn record_tool_call(
+    pub async fn record_tool_call_tx(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         session_id: &str,
         timestamp: DateTime<Utc>,
         tool_name: &str,
     ) -> Result<()> {
-        self.ensure_session_stub(session_id, timestamp).await?;
+        self.ensure_session_stub_tx(tx, session_id, timestamp).await?;
         sqlx::query(
             r#"
             INSERT INTO session_tool_calls (session_id, timestamp, tool_name)
@@ -1244,7 +1387,7 @@ impl Storage {
         .bind(session_id)
         .bind(timestamp.to_rfc3339())
         .bind(tool_name)
-        .execute(&*self.pool)
+        .execute(&mut **tx)
         .await
         .with_context(|| "failed to insert session tool call")?;
         Ok(())
@@ -1255,33 +1398,68 @@ impl Storage {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<AggregateTotals> {
-        let row = sqlx::query(
-            r#"
-            SELECT
-                COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
-                COALESCE(SUM(cached_prompt_tokens), 0) as cached_prompt_tokens,
-                COALESCE(SUM(completion_tokens), 0) as completion_tokens,
-                COALESCE(SUM(total_tokens), 0) as total_tokens,
-                COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
-                COALESCE(SUM(cost_usd), 0.0) as cost_usd,
-                COALESCE(SUM(missing_price), 0) as missing_price
-            FROM session_turn_costs
-            WHERE timestamp >= ? AND timestamp < ?
-            "#,
-        )
-        .bind(start.to_rfc3339())
-        .bind(end.to_rfc3339())
-        .fetch_one(&*self.pool)
-        .await
-        .with_context(|| "failed to load totals between timestamps")?;
+        let parts = split_range_local(start, end);
+        let mut totals = TotalsAccumulator::default();
+
+        if let (Some(start_date), Some(end_date)) = (parts.full_start, parts.full_end) {
+            if start_date < end_date {
+                let row = sqlx::query(
+                    r#"
+                    SELECT
+                        COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+                        COALESCE(SUM(cached_prompt_tokens), 0) as cached_prompt_tokens,
+                        COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+                        COALESCE(SUM(total_tokens), 0) as total_tokens,
+                        COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
+                        COALESCE(SUM(cost_usd), 0.0) as cost_usd,
+                        COALESCE(SUM(missing_price), 0) as missing_price
+                    FROM daily_stats_costs
+                    WHERE date >= ? AND date < ?
+                    "#,
+                )
+                .bind(start_date.to_string())
+                .bind(end_date.to_string())
+                .fetch_one(&*self.pool)
+                .await
+                .with_context(|| "failed to load daily totals between timestamps")?;
+                totals.add(totals_from_row(&row));
+            }
+        }
+
+        for (partial_start, partial_end) in parts.partials {
+            let row = sqlx::query(
+                r#"
+                SELECT
+                    COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+                    COALESCE(SUM(cached_prompt_tokens), 0) as cached_prompt_tokens,
+                    COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+                    COALESCE(SUM(total_tokens), 0) as total_tokens,
+                    COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
+                    COALESCE(SUM(cost_usd), 0.0) as cost_usd,
+                    COALESCE(SUM(missing_price), 0) as missing_price
+                FROM session_turn_costs
+                WHERE timestamp >= ? AND timestamp < ?
+                "#,
+            )
+            .bind(partial_start.to_rfc3339())
+            .bind(partial_end.to_rfc3339())
+            .fetch_one(&*self.pool)
+            .await
+            .with_context(|| "failed to load partial totals between timestamps")?;
+            totals.add(totals_from_row(&row));
+        }
 
         Ok(AggregateTotals {
-            prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
-            cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0) as u64,
-            completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
-            total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
-            reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
-            cost_usd: cost_from_row(&row),
+            prompt_tokens: totals.prompt_tokens.max(0) as u64,
+            cached_prompt_tokens: totals.cached_prompt_tokens.max(0) as u64,
+            completion_tokens: totals.completion_tokens.max(0) as u64,
+            total_tokens: totals.total_tokens.max(0) as u64,
+            reasoning_tokens: totals.reasoning_tokens.max(0) as u64,
+            cost_usd: if totals.missing_price > 0 {
+                None
+            } else {
+                Some(totals.cost_usd)
+            },
         })
     }
 
@@ -1290,26 +1468,67 @@ impl Storage {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<PeriodCounts> {
-        let row = sqlx::query(
+        let parts = split_range_local(start, end);
+        let mut session_ids: HashSet<String> = HashSet::new();
+
+        if let (Some(start_date), Some(end_date)) = (parts.full_start, parts.full_end) {
+            if start_date < end_date {
+                let rows = sqlx::query(
+                    r#"
+                    SELECT DISTINCT session_id
+                    FROM session_daily_stats
+                    WHERE date >= ? AND date < ?
+                    "#,
+                )
+                .bind(start_date.to_string())
+                .bind(end_date.to_string())
+                .fetch_all(&*self.pool)
+                .await
+                .with_context(|| "failed to load session ids from daily stats")?;
+                for row in rows {
+                    if let Ok(session_id) = row.try_get::<String, _>("session_id") {
+                        session_ids.insert(session_id);
+                    }
+                }
+            }
+        }
+
+        for (partial_start, partial_end) in parts.partials {
+            let rows = sqlx::query(
+                r#"
+                SELECT DISTINCT session_id
+                FROM session_turns
+                WHERE timestamp >= ? AND timestamp < ?
+                "#,
+            )
+            .bind(partial_start.to_rfc3339())
+            .bind(partial_end.to_rfc3339())
+            .fetch_all(&*self.pool)
+            .await
+            .with_context(|| "failed to load session ids from partial turns")?;
+            for row in rows {
+                if let Ok(session_id) = row.try_get::<String, _>("session_id") {
+                    session_ids.insert(session_id);
+                }
+            }
+        }
+
+        let message_count: i64 = sqlx::query_scalar(
             r#"
-            SELECT
-                (SELECT COUNT(DISTINCT session_id)
-                 FROM session_turns
-                 WHERE timestamp >= ?1 AND timestamp < ?2) AS session_count,
-                (SELECT COUNT(*)
-                 FROM session_messages
-                 WHERE timestamp >= ?1 AND timestamp < ?2) AS message_count
+            SELECT COUNT(*)
+            FROM session_messages
+            WHERE timestamp >= ? AND timestamp < ?
             "#,
         )
         .bind(start.to_rfc3339())
         .bind(end.to_rfc3339())
         .fetch_one(&*self.pool)
         .await
-        .with_context(|| "failed to load counts between timestamps")?;
+        .with_context(|| "failed to load message counts between timestamps")?;
 
         Ok(PeriodCounts {
-            session_count: row.try_get::<i64, _>("session_count").unwrap_or(0) as u64,
-            message_count: row.try_get::<i64, _>("message_count").unwrap_or(0) as u64,
+            session_count: session_ids.len() as u64,
+            message_count: message_count.max(0) as u64,
         })
     }
 
@@ -1318,33 +1537,69 @@ impl Storage {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<DailyTokenTotal>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                strftime('%Y-%m-%d', timestamp, 'localtime') AS day,
-                COALESCE(SUM(total_tokens), 0) AS total_tokens
-            FROM session_turns
-            WHERE timestamp >= ? AND timestamp < ?
-            GROUP BY day
-            ORDER BY day ASC
-            "#,
-        )
-        .bind(start.to_rfc3339())
-        .bind(end.to_rfc3339())
-        .fetch_all(&*self.pool)
-        .await
-        .with_context(|| "failed to load token totals by day")?;
+        let parts = split_range_local(start, end);
+        let mut totals_map: HashMap<NaiveDate, u64> = HashMap::new();
 
-        let mut totals = Vec::with_capacity(rows.len());
-        for row in rows {
-            let day_str: String = row.try_get("day")?;
-            let date = NaiveDate::parse_from_str(&day_str, "%Y-%m-%d")
-                .with_context(|| format!("invalid day in token totals: {day_str}"))?;
-            totals.push(DailyTokenTotal {
-                date,
-                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
-            });
+        if let (Some(start_date), Some(end_date)) = (parts.full_start, parts.full_end) {
+            if start_date < end_date {
+                let rows = sqlx::query(
+                    r#"
+                    SELECT date AS day,
+                           COALESCE(SUM(total_tokens), 0) AS total_tokens
+                    FROM daily_stats
+                    WHERE date >= ? AND date < ?
+                    GROUP BY day
+                    ORDER BY day ASC
+                    "#,
+                )
+                .bind(start_date.to_string())
+                .bind(end_date.to_string())
+                .fetch_all(&*self.pool)
+                .await
+                .with_context(|| "failed to load daily token totals")?;
+
+                for row in rows {
+                    let day_str: String = row.try_get("day")?;
+                    let date = NaiveDate::parse_from_str(&day_str, "%Y-%m-%d")
+                        .with_context(|| format!("invalid day in token totals: {day_str}"))?;
+                    let total = row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64;
+                    totals_map.insert(date, total);
+                }
+            }
         }
+
+        for (partial_start, partial_end) in parts.partials {
+            let rows = sqlx::query(
+                r#"
+                SELECT
+                    strftime('%Y-%m-%d', timestamp, 'localtime') AS day,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens
+                FROM session_turns
+                WHERE timestamp >= ? AND timestamp < ?
+                GROUP BY day
+                "#,
+            )
+            .bind(partial_start.to_rfc3339())
+            .bind(partial_end.to_rfc3339())
+            .fetch_all(&*self.pool)
+            .await
+            .with_context(|| "failed to load partial token totals by day")?;
+
+            for row in rows {
+                let day_str: String = row.try_get("day")?;
+                let date = NaiveDate::parse_from_str(&day_str, "%Y-%m-%d")
+                    .with_context(|| format!("invalid day in token totals: {day_str}"))?;
+                let total = row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64;
+                let entry = totals_map.entry(date).or_insert(0);
+                *entry += total;
+            }
+        }
+
+        let mut totals: Vec<DailyTokenTotal> = totals_map
+            .into_iter()
+            .map(|(date, total_tokens)| DailyTokenTotal { date, total_tokens })
+            .collect();
+        totals.sort_by_key(|entry| entry.date);
         Ok(totals)
     }
 
@@ -1357,35 +1612,79 @@ impl Storage {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let parts = split_range_local(start, end);
+        let mut totals_map: HashMap<String, ModelCostTotal> = HashMap::new();
 
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                model,
-                COALESCE(SUM(total_tokens), 0) AS total_tokens,
-                COALESCE(SUM(cost_usd), 0.0) AS cost_usd
-            FROM session_turn_costs
-            WHERE timestamp BETWEEN ?1 AND ?2
-            GROUP BY model
-            ORDER BY cost_usd DESC, total_tokens DESC
-            LIMIT ?3
-            "#,
-        )
-        .bind(start.to_rfc3339())
-        .bind(end.to_rfc3339())
-        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(&*self.pool)
-        .await
-        .with_context(|| "failed to load model usage by cost")?;
+        if let (Some(start_date), Some(end_date)) = (parts.full_start, parts.full_end) {
+            if start_date < end_date {
+                let rows = sqlx::query(
+                    r#"
+                    SELECT
+                        model,
+                        COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                        COALESCE(SUM(cost_usd), 0.0) AS cost_usd
+                    FROM daily_stats_costs
+                    WHERE date >= ? AND date < ?
+                    GROUP BY model
+                    "#,
+                )
+                .bind(start_date.to_string())
+                .bind(end_date.to_string())
+                .fetch_all(&*self.pool)
+                .await
+                .with_context(|| "failed to load model usage from daily stats")?;
 
-        let mut totals = Vec::with_capacity(rows.len());
-        for row in rows {
-            totals.push(ModelCostTotal {
-                model: row.try_get::<String, _>("model")?,
-                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
-                cost_usd: row.try_get::<f64, _>("cost_usd").unwrap_or(0.0),
-            });
+                for row in rows {
+                    let model: String = row.try_get("model")?;
+                    let entry = totals_map.entry(model.clone()).or_insert(ModelCostTotal {
+                        model,
+                        total_tokens: 0,
+                        cost_usd: 0.0,
+                    });
+                    entry.total_tokens += row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64;
+                    entry.cost_usd += row.try_get::<f64, _>("cost_usd").unwrap_or(0.0);
+                }
+            }
         }
+
+        for (partial_start, partial_end) in parts.partials {
+            let rows = sqlx::query(
+                r#"
+                SELECT
+                    model,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                    COALESCE(SUM(cost_usd), 0.0) AS cost_usd
+                FROM session_turn_costs
+                WHERE timestamp >= ? AND timestamp < ?
+                GROUP BY model
+                "#,
+            )
+            .bind(partial_start.to_rfc3339())
+            .bind(partial_end.to_rfc3339())
+            .fetch_all(&*self.pool)
+            .await
+            .with_context(|| "failed to load model usage from partial turns")?;
+
+            for row in rows {
+                let model: String = row.try_get("model")?;
+                let entry = totals_map.entry(model.clone()).or_insert(ModelCostTotal {
+                    model,
+                    total_tokens: 0,
+                    cost_usd: 0.0,
+                });
+                entry.total_tokens += row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64;
+                entry.cost_usd += row.try_get::<f64, _>("cost_usd").unwrap_or(0.0);
+            }
+        }
+
+        let mut totals: Vec<ModelCostTotal> = totals_map.into_values().collect();
+        totals.sort_by(|a, b| {
+            b.cost_usd
+                .partial_cmp(&a.cost_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.total_tokens.cmp(&a.total_tokens))
+        });
+        totals.truncate(limit);
         Ok(totals)
     }
 
@@ -1398,37 +1697,83 @@ impl Storage {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let parts = split_range_local(start, end);
+        let mut totals_map: HashMap<String, RepoCostTotal> = HashMap::new();
 
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                COALESCE(NULLIF(s.repo_url, ''), NULLIF(s.cwd, '')) AS repo,
-                COALESCE(SUM(t.total_tokens), 0) AS total_tokens,
-                COALESCE(SUM(t.cost_usd), 0.0) AS cost_usd
-            FROM session_turn_costs t
-            JOIN sessions s ON s.session_id = t.session_id
-            WHERE t.timestamp BETWEEN ?1 AND ?2
-              AND COALESCE(NULLIF(s.repo_url, ''), NULLIF(s.cwd, '')) IS NOT NULL
-            GROUP BY repo
-            ORDER BY cost_usd DESC, total_tokens DESC
-            LIMIT ?3
-            "#,
-        )
-        .bind(start.to_rfc3339())
-        .bind(end.to_rfc3339())
-        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(&*self.pool)
-        .await
-        .with_context(|| "failed to load repo usage by cost")?;
+        if let (Some(start_date), Some(end_date)) = (parts.full_start, parts.full_end) {
+            if start_date < end_date {
+                let rows = sqlx::query(
+                    r#"
+                    SELECT
+                        COALESCE(NULLIF(s.repo_url, ''), NULLIF(s.cwd, '')) AS repo,
+                        COALESCE(SUM(d.total_tokens), 0) AS total_tokens,
+                        COALESCE(SUM(d.cost_usd), 0.0) AS cost_usd
+                    FROM session_daily_costs d
+                    JOIN sessions s ON s.session_id = d.session_id
+                    WHERE d.date >= ? AND d.date < ?
+                      AND COALESCE(NULLIF(s.repo_url, ''), NULLIF(s.cwd, '')) IS NOT NULL
+                    GROUP BY repo
+                    "#,
+                )
+                .bind(start_date.to_string())
+                .bind(end_date.to_string())
+                .fetch_all(&*self.pool)
+                .await
+                .with_context(|| "failed to load repo usage from daily stats")?;
 
-        let mut totals = Vec::with_capacity(rows.len());
-        for row in rows {
-            totals.push(RepoCostTotal {
-                repo: row.try_get::<String, _>("repo")?,
-                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
-                cost_usd: row.try_get::<f64, _>("cost_usd").unwrap_or(0.0),
-            });
+                for row in rows {
+                    let repo: String = row.try_get("repo")?;
+                    let entry = totals_map.entry(repo.clone()).or_insert(RepoCostTotal {
+                        repo,
+                        total_tokens: 0,
+                        cost_usd: 0.0,
+                    });
+                    entry.total_tokens += row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64;
+                    entry.cost_usd += row.try_get::<f64, _>("cost_usd").unwrap_or(0.0);
+                }
+            }
         }
+
+        for (partial_start, partial_end) in parts.partials {
+            let rows = sqlx::query(
+                r#"
+                SELECT
+                    COALESCE(NULLIF(s.repo_url, ''), NULLIF(s.cwd, '')) AS repo,
+                    COALESCE(SUM(t.total_tokens), 0) AS total_tokens,
+                    COALESCE(SUM(t.cost_usd), 0.0) AS cost_usd
+                FROM session_turn_costs t
+                JOIN sessions s ON s.session_id = t.session_id
+                WHERE t.timestamp >= ? AND t.timestamp < ?
+                  AND COALESCE(NULLIF(s.repo_url, ''), NULLIF(s.cwd, '')) IS NOT NULL
+                GROUP BY repo
+                "#,
+            )
+            .bind(partial_start.to_rfc3339())
+            .bind(partial_end.to_rfc3339())
+            .fetch_all(&*self.pool)
+            .await
+            .with_context(|| "failed to load repo usage from partial turns")?;
+
+            for row in rows {
+                let repo: String = row.try_get("repo")?;
+                let entry = totals_map.entry(repo.clone()).or_insert(RepoCostTotal {
+                    repo,
+                    total_tokens: 0,
+                    cost_usd: 0.0,
+                });
+                entry.total_tokens += row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64;
+                entry.cost_usd += row.try_get::<f64, _>("cost_usd").unwrap_or(0.0);
+            }
+        }
+
+        let mut totals: Vec<RepoCostTotal> = totals_map.into_values().collect();
+        totals.sort_by(|a, b| {
+            b.cost_usd
+                .partial_cmp(&a.cost_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.total_tokens.cmp(&a.total_tokens))
+        });
+        totals.truncate(limit);
         Ok(totals)
     }
 
@@ -1437,28 +1782,58 @@ impl Storage {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<u64> {
-        let row = sqlx::query(
-            r#"
-            SELECT COUNT(DISTINCT project) AS project_count
-            FROM (
-                SELECT COALESCE(NULLIF(repo_url, ''), NULLIF(cwd, '')) AS project
-                FROM sessions
-                WHERE session_id IN (
-                    SELECT DISTINCT session_id
-                    FROM session_turns
-                    WHERE timestamp >= ?1 AND timestamp < ?2
-                )
-            )
-            WHERE project IS NOT NULL
-            "#,
-        )
-        .bind(start.to_rfc3339())
-        .bind(end.to_rfc3339())
-        .fetch_one(&*self.pool)
-        .await
-        .with_context(|| "failed to load project count")?;
+        let parts = split_range_local(start, end);
+        let mut projects: HashSet<String> = HashSet::new();
 
-        Ok(row.try_get::<i64, _>("project_count").unwrap_or(0) as u64)
+        if let (Some(start_date), Some(end_date)) = (parts.full_start, parts.full_end) {
+            if start_date < end_date {
+                let rows = sqlx::query(
+                    r#"
+                    SELECT DISTINCT COALESCE(NULLIF(s.repo_url, ''), NULLIF(s.cwd, '')) AS project
+                    FROM sessions s
+                    JOIN session_daily_stats d ON d.session_id = s.session_id
+                    WHERE d.date >= ? AND d.date < ?
+                      AND COALESCE(NULLIF(s.repo_url, ''), NULLIF(s.cwd, '')) IS NOT NULL
+                    "#,
+                )
+                .bind(start_date.to_string())
+                .bind(end_date.to_string())
+                .fetch_all(&*self.pool)
+                .await
+                .with_context(|| "failed to load projects from daily stats")?;
+
+                for row in rows {
+                    if let Ok(project) = row.try_get::<String, _>("project") {
+                        projects.insert(project);
+                    }
+                }
+            }
+        }
+
+        for (partial_start, partial_end) in parts.partials {
+            let rows = sqlx::query(
+                r#"
+                SELECT DISTINCT COALESCE(NULLIF(s.repo_url, ''), NULLIF(s.cwd, '')) AS project
+                FROM sessions s
+                JOIN session_turns t ON t.session_id = s.session_id
+                WHERE t.timestamp >= ? AND t.timestamp < ?
+                  AND COALESCE(NULLIF(s.repo_url, ''), NULLIF(s.cwd, '')) IS NOT NULL
+                "#,
+            )
+            .bind(partial_start.to_rfc3339())
+            .bind(partial_end.to_rfc3339())
+            .fetch_all(&*self.pool)
+            .await
+            .with_context(|| "failed to load projects from partial turns")?;
+
+            for row in rows {
+                if let Ok(project) = row.try_get::<String, _>("project") {
+                    projects.insert(project);
+                }
+            }
+        }
+
+        Ok(projects.len() as u64)
     }
 
     pub async fn first_session_timestamp(&self) -> Result<Option<DateTime<Utc>>> {
@@ -1509,46 +1884,210 @@ impl Storage {
         end: DateTime<Utc>,
         bucket_expr: &str,
     ) -> Result<Vec<BucketTotals>> {
-        let query = format!(
-            r#"
-            SELECT
-                {bucket_expr} AS bucket,
-                COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
-                COALESCE(SUM(cached_prompt_tokens), 0) as cached_prompt_tokens,
-                COALESCE(SUM(completion_tokens), 0) as completion_tokens,
-                COALESCE(SUM(total_tokens), 0) as total_tokens,
-                COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
-                COALESCE(SUM(cost_usd), 0.0) as cost_usd,
-                COALESCE(SUM(missing_price), 0) as missing_price,
-                COUNT(DISTINCT session_id) as session_count
-            FROM session_turn_costs
-            WHERE timestamp >= ? AND timestamp < ?
-            GROUP BY bucket
-            ORDER BY bucket ASC
-            "#
-        );
-        let rows = sqlx::query(&query)
-            .bind(start.to_rfc3339())
-            .bind(end.to_rfc3339())
-            .fetch_all(&*self.pool)
-            .await
-            .with_context(|| "failed to aggregate usage by bucket")?;
+        if bucket_expr.contains("%H") {
+            let query = format!(
+                r#"
+                SELECT
+                    {bucket_expr} AS bucket,
+                    COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+                    COALESCE(SUM(cached_prompt_tokens), 0) as cached_prompt_tokens,
+                    COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+                    COALESCE(SUM(total_tokens), 0) as total_tokens,
+                    COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
+                    COALESCE(SUM(cost_usd), 0.0) as cost_usd,
+                    COALESCE(SUM(missing_price), 0) as missing_price,
+                    COUNT(DISTINCT session_id) as session_count
+                FROM session_turn_costs
+                WHERE timestamp >= ? AND timestamp < ?
+                GROUP BY bucket
+                ORDER BY bucket ASC
+                "#
+            );
+            let rows = sqlx::query(&query)
+                .bind(start.to_rfc3339())
+                .bind(end.to_rfc3339())
+                .fetch_all(&*self.pool)
+                .await
+                .with_context(|| "failed to aggregate usage by bucket")?;
 
-        let mut buckets = Vec::with_capacity(rows.len());
-        for row in rows {
+            let mut buckets = Vec::with_capacity(rows.len());
+            for row in rows {
+                buckets.push(BucketTotals {
+                    bucket: row.try_get::<String, _>("bucket")?,
+                    totals: AggregateTotals {
+                        prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+                        cached_prompt_tokens: row
+                            .try_get::<i64, _>("cached_prompt_tokens")
+                            .unwrap_or(0) as u64,
+                        completion_tokens: row
+                            .try_get::<i64, _>("completion_tokens")
+                            .unwrap_or(0) as u64,
+                        total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+                        reasoning_tokens: row
+                            .try_get::<i64, _>("reasoning_tokens")
+                            .unwrap_or(0) as u64,
+                        cost_usd: cost_from_row(&row),
+                    },
+                    session_count: row.try_get::<i64, _>("session_count").unwrap_or(0) as u64,
+                });
+            }
+
+            return Ok(buckets);
+        }
+
+        struct BucketAgg {
+            totals: TotalsAccumulator,
+            sessions: HashSet<String>,
+        }
+
+        let parts = split_range_local(start, end);
+        let mut bucket_map: HashMap<String, BucketAgg> = HashMap::new();
+
+        let daily_bucket_expr = if bucket_expr.contains("%Y-%m-%d") {
+            "date".to_string()
+        } else if bucket_expr.contains("%Y-%m") {
+            "strftime('%Y-%m', date)".to_string()
+        } else {
+            "strftime('%Y', date)".to_string()
+        };
+
+        if let (Some(start_date), Some(end_date)) = (parts.full_start, parts.full_end) {
+            if start_date < end_date {
+                let query = format!(
+                    r#"
+                    SELECT
+                        {daily_bucket_expr} AS bucket,
+                        COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+                        COALESCE(SUM(cached_prompt_tokens), 0) as cached_prompt_tokens,
+                        COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+                        COALESCE(SUM(total_tokens), 0) as total_tokens,
+                        COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
+                        COALESCE(SUM(cost_usd), 0.0) as cost_usd,
+                        COALESCE(SUM(missing_price), 0) as missing_price
+                    FROM daily_stats_costs
+                    WHERE date >= ? AND date < ?
+                    GROUP BY bucket
+                    "#
+                );
+                let rows = sqlx::query(&query)
+                    .bind(start_date.to_string())
+                    .bind(end_date.to_string())
+                    .fetch_all(&*self.pool)
+                    .await
+                    .with_context(|| "failed to aggregate daily usage by bucket")?;
+
+                for row in rows {
+                    let bucket: String = row.try_get("bucket")?;
+                    let entry = bucket_map.entry(bucket).or_insert(BucketAgg {
+                        totals: TotalsAccumulator::default(),
+                        sessions: HashSet::new(),
+                    });
+                    entry.totals.add(totals_from_row(&row));
+                }
+
+                let query = format!(
+                    r#"
+                    SELECT {daily_bucket_expr} AS bucket,
+                           session_id
+                    FROM session_daily_stats
+                    WHERE date >= ? AND date < ?
+                    GROUP BY bucket, session_id
+                    "#
+                );
+                let rows = sqlx::query(&query)
+                    .bind(start_date.to_string())
+                    .bind(end_date.to_string())
+                    .fetch_all(&*self.pool)
+                    .await
+                    .with_context(|| "failed to aggregate daily session counts")?;
+                for row in rows {
+                    let bucket: String = row.try_get("bucket")?;
+                    let session_id: String = row.try_get("session_id")?;
+                    let entry = bucket_map.entry(bucket).or_insert(BucketAgg {
+                        totals: TotalsAccumulator::default(),
+                        sessions: HashSet::new(),
+                    });
+                    entry.sessions.insert(session_id);
+                }
+            }
+        }
+
+        for (partial_start, partial_end) in parts.partials {
+            let query = format!(
+                r#"
+                SELECT
+                    {bucket_expr} AS bucket,
+                    COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+                    COALESCE(SUM(cached_prompt_tokens), 0) as cached_prompt_tokens,
+                    COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+                    COALESCE(SUM(total_tokens), 0) as total_tokens,
+                    COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
+                    COALESCE(SUM(cost_usd), 0.0) as cost_usd,
+                    COALESCE(SUM(missing_price), 0) as missing_price
+                FROM session_turn_costs
+                WHERE timestamp >= ? AND timestamp < ?
+                GROUP BY bucket
+                "#
+            );
+            let rows = sqlx::query(&query)
+                .bind(partial_start.to_rfc3339())
+                .bind(partial_end.to_rfc3339())
+                .fetch_all(&*self.pool)
+                .await
+                .with_context(|| "failed to aggregate partial usage by bucket")?;
+
+            for row in rows {
+                let bucket: String = row.try_get("bucket")?;
+                let entry = bucket_map.entry(bucket).or_insert(BucketAgg {
+                    totals: TotalsAccumulator::default(),
+                    sessions: HashSet::new(),
+                });
+                entry.totals.add(totals_from_row(&row));
+            }
+
+            let query = format!(
+                r#"
+                SELECT {bucket_expr} AS bucket,
+                       session_id
+                FROM session_turns
+                WHERE timestamp >= ? AND timestamp < ?
+                GROUP BY bucket, session_id
+                "#
+            );
+            let rows = sqlx::query(&query)
+                .bind(partial_start.to_rfc3339())
+                .bind(partial_end.to_rfc3339())
+                .fetch_all(&*self.pool)
+                .await
+                .with_context(|| "failed to aggregate partial session counts")?;
+            for row in rows {
+                let bucket: String = row.try_get("bucket")?;
+                let session_id: String = row.try_get("session_id")?;
+                let entry = bucket_map.entry(bucket).or_insert(BucketAgg {
+                    totals: TotalsAccumulator::default(),
+                    sessions: HashSet::new(),
+                });
+                entry.sessions.insert(session_id);
+            }
+        }
+
+        let mut buckets = Vec::with_capacity(bucket_map.len());
+        for (bucket, agg) in bucket_map {
             buckets.push(BucketTotals {
-                bucket: row.try_get::<String, _>("bucket")?,
+                bucket,
                 totals: AggregateTotals {
-                    prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
-                    cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0)
-                        as u64,
-                    completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0)
-                        as u64,
-                    total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
-                    reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
-                    cost_usd: cost_from_row(&row),
+                    prompt_tokens: agg.totals.prompt_tokens.max(0) as u64,
+                    cached_prompt_tokens: agg.totals.cached_prompt_tokens.max(0) as u64,
+                    completion_tokens: agg.totals.completion_tokens.max(0) as u64,
+                    total_tokens: agg.totals.total_tokens.max(0) as u64,
+                    reasoning_tokens: agg.totals.reasoning_tokens.max(0) as u64,
+                    cost_usd: if agg.totals.missing_price > 0 {
+                        None
+                    } else {
+                        Some(agg.totals.cost_usd)
+                    },
                 },
-                session_count: row.try_get::<i64, _>("session_count").unwrap_or(0) as u64,
+                session_count: agg.sessions.len() as u64,
             });
         }
 
@@ -1621,21 +2160,52 @@ impl Storage {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<usize> {
-        let row = sqlx::query(
-            r#"
-            SELECT COUNT(DISTINCT session_id) AS total
-            FROM session_turn_costs
-            WHERE timestamp BETWEEN ?1 AND ?2
-            "#,
-        )
-        .bind(start.to_rfc3339())
-        .bind(end.to_rfc3339())
-        .fetch_one(&*self.pool)
-        .await
-        .with_context(|| "failed to count sessions in range")?;
+        let parts = split_range_local(start, end);
+        let mut session_ids: HashSet<String> = HashSet::new();
 
-        let total = row.try_get::<i64, _>("total").unwrap_or(0);
-        Ok(total.max(0) as usize)
+        if let (Some(start_date), Some(end_date)) = (parts.full_start, parts.full_end) {
+            if start_date < end_date {
+                let rows = sqlx::query(
+                    r#"
+                    SELECT DISTINCT session_id
+                    FROM session_daily_stats
+                    WHERE date >= ? AND date < ?
+                    "#,
+                )
+                .bind(start_date.to_string())
+                .bind(end_date.to_string())
+                .fetch_all(&*self.pool)
+                .await
+                .with_context(|| "failed to count sessions from daily stats")?;
+                for row in rows {
+                    if let Ok(session_id) = row.try_get::<String, _>("session_id") {
+                        session_ids.insert(session_id);
+                    }
+                }
+            }
+        }
+
+        for (partial_start, partial_end) in parts.partials {
+            let rows = sqlx::query(
+                r#"
+                SELECT DISTINCT session_id
+                FROM session_turns
+                WHERE timestamp >= ? AND timestamp < ?
+                "#,
+            )
+            .bind(partial_start.to_rfc3339())
+            .bind(partial_end.to_rfc3339())
+            .fetch_all(&*self.pool)
+            .await
+            .with_context(|| "failed to count sessions from partial turns")?;
+            for row in rows {
+                if let Ok(session_id) = row.try_get::<String, _>("session_id") {
+                    session_ids.insert(session_id);
+                }
+            }
+        }
+
+        Ok(session_ids.len())
     }
 
     pub async fn sessions_page_by_recent_between(
@@ -1819,7 +2389,11 @@ impl Storage {
         map_session_turn_rows(rows, "message turns")
     }
 
-    pub async fn upsert_session_meta(&self, meta: &SessionMeta) -> Result<()> {
+    pub async fn upsert_session_meta_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        meta: &SessionMeta,
+    ) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO sessions (
@@ -1849,13 +2423,18 @@ impl Storage {
         .bind(meta.model_provider.as_deref())
         .bind(meta.subagent.as_deref())
         .bind(meta.last_model.as_deref())
-        .execute(&*self.pool)
+        .execute(&mut **tx)
         .await
         .with_context(|| "failed to upsert session metadata")?;
         Ok(())
     }
 
-    pub async fn set_session_title_if_empty(&self, session_id: &str, title: &str) -> Result<()> {
+    pub async fn set_session_title_if_empty_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        session_id: &str,
+        title: &str,
+    ) -> Result<()> {
         sqlx::query(
             r#"
             UPDATE sessions
@@ -1866,19 +2445,20 @@ impl Storage {
         )
         .bind(title)
         .bind(session_id)
-        .execute(&*self.pool)
+        .execute(&mut **tx)
         .await
         .with_context(|| "failed to update session title")?;
         Ok(())
     }
 
-    pub async fn set_session_summary(
+    pub async fn set_session_summary_tx(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         session_id: &str,
         summary: &str,
         timestamp: DateTime<Utc>,
     ) -> Result<()> {
-        self.ensure_session_stub(session_id, timestamp).await?;
+        self.ensure_session_stub_tx(tx, session_id, timestamp).await?;
         sqlx::query(
             r#"
             UPDATE sessions
@@ -1890,13 +2470,18 @@ impl Storage {
         .bind(summary)
         .bind(timestamp.to_rfc3339())
         .bind(session_id)
-        .execute(&*self.pool)
+        .execute(&mut **tx)
         .await
         .with_context(|| "failed to update session summary")?;
         Ok(())
     }
 
-    pub async fn set_session_summary_only(&self, session_id: &str, summary: &str) -> Result<()> {
+    pub async fn set_session_summary_only_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        session_id: &str,
+        summary: &str,
+    ) -> Result<()> {
         sqlx::query(
             r#"
             UPDATE sessions
@@ -1906,14 +2491,15 @@ impl Storage {
         )
         .bind(summary)
         .bind(session_id)
-        .execute(&*self.pool)
+        .execute(&mut **tx)
         .await
         .with_context(|| "failed to update session summary only")?;
         Ok(())
     }
 
-    pub async fn record_user_message(
+    pub async fn record_user_message_tx(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         session_id: &str,
         timestamp: DateTime<Utc>,
         snippet: &str,
@@ -1921,7 +2507,6 @@ impl Storage {
     ) -> Result<i64> {
         let timestamp_str = timestamp.to_rfc3339();
         let message_seq = i64::try_from(message_seq).unwrap_or(i64::MAX);
-        let mut tx = self.pool.begin().await?;
 
         sqlx::query(
             r#"
@@ -1937,7 +2522,7 @@ impl Storage {
         .bind(session_id)
         .bind(&timestamp_str)
         .bind(&timestamp_str)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .with_context(|| "failed to ensure session row for message")?;
 
@@ -1952,7 +2537,7 @@ impl Storage {
         .bind(&timestamp_str)
         .bind(snippet)
         .bind(message_seq)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .with_context(|| "failed to insert session message")?;
 
@@ -1967,7 +2552,7 @@ impl Storage {
             )
             .bind(&timestamp_str)
             .bind(session_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .with_context(|| "failed to update session message count")?;
 
@@ -1982,19 +2567,19 @@ impl Storage {
             )
             .bind(session_id)
             .bind(message_seq)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .with_context(|| "failed to load existing message id")?;
             existing.unwrap_or(0)
         };
 
-        tx.commit().await?;
         Ok(message_id)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn record_turn(
+    pub async fn record_turn_tx(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         session_id: &str,
         timestamp: DateTime<Utc>,
         model: &str,
@@ -2008,7 +2593,7 @@ impl Storage {
         total_tokens: u64,
         message_id: Option<i64>,
     ) -> Result<()> {
-        let date = timestamp.date_naive();
+        let date = timestamp.with_timezone(&Local).date_naive();
         let timestamp_str = timestamp.to_rfc3339();
         let prompt_tokens = i64::try_from(prompt_tokens).unwrap_or(i64::MAX);
         let cached_prompt_tokens = i64::try_from(cached_prompt_tokens).unwrap_or(i64::MAX);
@@ -2017,9 +2602,8 @@ impl Storage {
         let total_tokens = i64::try_from(total_tokens).unwrap_or(i64::MAX);
         let context_window = context_window.and_then(|value| i64::try_from(value).ok());
         let message_id = message_id.and_then(|value| if value > 0 { Some(value) } else { None });
-        let mut tx = self.pool.begin().await?;
 
-        self.ensure_model_price_tx(&mut tx, model).await?;
+        self.ensure_model_price_tx(tx, model).await?;
 
         sqlx::query(
             r#"
@@ -2037,80 +2621,9 @@ impl Storage {
         .bind(&timestamp_str)
         .bind(&timestamp_str)
         .bind(model)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .with_context(|| "failed to ensure session row for turn")?;
-
-        let duplicate: Option<i64> = sqlx::query_scalar(
-            r#"
-            SELECT 1
-            FROM session_turns
-            WHERE session_id = ?
-              AND timestamp = ?
-              AND model = ?
-              AND prompt_tokens = ?
-              AND cached_prompt_tokens = ?
-              AND completion_tokens = ?
-              AND reasoning_tokens = ?
-              AND total_tokens = ?
-            LIMIT 1
-            "#,
-        )
-        .bind(session_id)
-        .bind(&timestamp_str)
-        .bind(model)
-        .bind(prompt_tokens)
-        .bind(cached_prompt_tokens)
-        .bind(completion_tokens)
-        .bind(reasoning_tokens)
-        .bind(total_tokens)
-        .fetch_optional(&mut *tx)
-        .await
-        .with_context(|| "failed to check for duplicate session turn")?;
-
-        if duplicate.is_some() {
-            if note.is_some()
-                || context_window.is_some()
-                || reasoning_effort.is_some()
-                || message_id.is_some()
-            {
-                sqlx::query(
-                    r#"
-                    UPDATE session_turns
-                    SET
-                        note = COALESCE(note, ?),
-                        context_window = COALESCE(context_window, ?),
-                        reasoning_effort = COALESCE(reasoning_effort, ?),
-                        message_id = COALESCE(message_id, ?)
-                    WHERE session_id = ?
-                      AND timestamp = ?
-                      AND model = ?
-                      AND prompt_tokens = ?
-                      AND cached_prompt_tokens = ?
-                      AND completion_tokens = ?
-                      AND reasoning_tokens = ?
-                      AND total_tokens = ?
-                    "#,
-                )
-                .bind(note)
-                .bind(context_window)
-                .bind(reasoning_effort)
-                .bind(message_id)
-                .bind(session_id)
-                .bind(&timestamp_str)
-                .bind(model)
-                .bind(prompt_tokens)
-                .bind(cached_prompt_tokens)
-                .bind(completion_tokens)
-                .bind(reasoning_tokens)
-                .bind(total_tokens)
-                .execute(&mut *tx)
-                .await
-                .with_context(|| "failed to update duplicate session turn metadata")?;
-            }
-            tx.commit().await?;
-            return Ok(());
-        }
 
         let insert_result = sqlx::query(
             r#"
@@ -2132,7 +2645,7 @@ impl Storage {
         .bind(completion_tokens)
         .bind(reasoning_tokens)
         .bind(total_tokens)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .with_context(|| "failed to insert session turn")?;
 
@@ -2174,11 +2687,10 @@ impl Storage {
                 .bind(completion_tokens)
                 .bind(reasoning_tokens)
                 .bind(total_tokens)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .with_context(|| "failed to update ignored session turn metadata")?;
             }
-            tx.commit().await?;
             return Ok(());
         }
 
@@ -2204,7 +2716,7 @@ impl Storage {
         .bind(completion_tokens)
         .bind(reasoning_tokens)
         .bind(total_tokens)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .with_context(|| "failed to upsert session daily stats")?;
 
@@ -2229,7 +2741,7 @@ impl Storage {
         .bind(completion_tokens)
         .bind(reasoning_tokens)
         .bind(total_tokens)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .with_context(|| "failed to upsert daily stats")?;
 
@@ -2259,11 +2771,10 @@ impl Storage {
         .bind(completion_tokens)
         .bind(reasoning_tokens)
         .bind(total_tokens)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .with_context(|| "failed to upsert session totals")?;
 
-        tx.commit().await?;
         Ok(())
     }
 
@@ -2394,7 +2905,11 @@ impl Storage {
         Ok(states)
     }
 
-    pub async fn upsert_ingest_state(&self, state: &IngestStateRow) -> Result<()> {
+    pub async fn upsert_ingest_state_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        state: &IngestStateRow,
+    ) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO ingest_state (
@@ -2418,7 +2933,8 @@ impl Storage {
                 last_committed_input_tokens = excluded.last_committed_input_tokens,
                 last_committed_cached_input_tokens = excluded.last_committed_cached_input_tokens,
                 last_committed_output_tokens = excluded.last_committed_output_tokens,
-                last_committed_reasoning_output_tokens = excluded.last_committed_reasoning_output_tokens,
+                last_committed_reasoning_output_tokens =
+                    excluded.last_committed_reasoning_output_tokens,
                 last_committed_total_tokens = excluded.last_committed_total_tokens,
                 current_message_id = excluded.current_message_id,
                 current_message_seq = excluded.current_message_seq,
@@ -2443,13 +2959,38 @@ impl Storage {
         .bind(i64::try_from(state.current_message_seq).unwrap_or(i64::MAX))
         .bind(state.current_model.as_deref())
         .bind(state.current_effort.as_deref())
-        .execute(&*self.pool)
+        .execute(&mut **tx)
         .await
         .with_context(|| "failed to upsert ingest state")?;
         Ok(())
     }
 
-    async fn ensure_session_stub(&self, session_id: &str, timestamp: DateTime<Utc>) -> Result<()> {
+    pub async fn update_ingest_activity_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        timestamp: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO ingest_meta (id, last_ingest_at)
+            VALUES (1, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                last_ingest_at = excluded.last_ingest_at
+            "#,
+        )
+        .bind(timestamp.to_rfc3339())
+        .execute(&mut **tx)
+        .await
+        .with_context(|| "failed to update ingest_meta")?;
+        Ok(())
+    }
+
+    async fn ensure_session_stub_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        session_id: &str,
+        timestamp: DateTime<Utc>,
+    ) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO sessions (
@@ -2464,7 +3005,7 @@ impl Storage {
         .bind(session_id)
         .bind(timestamp.to_rfc3339())
         .bind(timestamp.to_rfc3339())
-        .execute(&*self.pool)
+        .execute(&mut **tx)
         .await
         .with_context(|| "failed to ensure session stub")?;
         Ok(())
@@ -2786,6 +3327,115 @@ fn cost_from_row(row: &SqliteRow) -> Option<f64> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct TotalsAccumulator {
+    prompt_tokens: i64,
+    cached_prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+    reasoning_tokens: i64,
+    cost_usd: f64,
+    missing_price: i64,
+}
+
+impl TotalsAccumulator {
+    fn add(&mut self, other: TotalsAccumulator) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.cached_prompt_tokens += other.cached_prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.total_tokens += other.total_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+        self.cost_usd += other.cost_usd;
+        self.missing_price += other.missing_price;
+    }
+}
+
+fn totals_from_row(row: &SqliteRow) -> TotalsAccumulator {
+    TotalsAccumulator {
+        prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0),
+        cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0),
+        completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0),
+        total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0),
+        reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0),
+        cost_usd: row.try_get::<f64, _>("cost_usd").unwrap_or(0.0),
+        missing_price: row.try_get::<i64, _>("missing_price").unwrap_or(0),
+    }
+}
+
+struct RangeParts {
+    full_start: Option<NaiveDate>,
+    full_end: Option<NaiveDate>,
+    partials: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+}
+
+fn local_start_of_day(date: NaiveDate) -> DateTime<Utc> {
+    let naive = date.and_hms_opt(0, 0, 0).unwrap_or_else(|| {
+        NaiveDate::from_ymd_opt(1970, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+    });
+    match Local.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => dt.with_timezone(&Utc),
+        LocalResult::Ambiguous(earliest, _) => earliest.with_timezone(&Utc),
+        LocalResult::None => Local
+            .from_local_datetime(&(naive + ChronoDuration::hours(1)))
+            .earliest()
+            .unwrap_or_else(Local::now)
+            .with_timezone(&Utc),
+    }
+}
+
+fn split_range_local(start: DateTime<Utc>, end: DateTime<Utc>) -> RangeParts {
+    let mut parts = RangeParts {
+        full_start: None,
+        full_end: None,
+        partials: Vec::new(),
+    };
+    if end <= start {
+        return parts;
+    }
+
+    let start_date = start.with_timezone(&Local).date_naive();
+    let end_date = end.with_timezone(&Local).date_naive();
+
+    if start_date == end_date {
+        parts.partials.push((start, end));
+        return parts;
+    }
+
+    let start_day_start = local_start_of_day(start_date);
+    let end_day_start = local_start_of_day(end_date);
+
+    let mut full_start = start_date;
+    if start > start_day_start {
+        let next_day = start_date
+            .checked_add_signed(ChronoDuration::days(1))
+            .unwrap_or(start_date);
+        let next_day_start = local_start_of_day(next_day);
+        let partial_end = next_day_start.min(end);
+        if partial_end > start {
+            parts.partials.push((start, partial_end));
+        }
+        full_start = next_day;
+    }
+
+    let mut full_end = end_date;
+    if end > end_day_start {
+        if end > start {
+            parts.partials.push((end_day_start, end));
+        }
+        full_end = end_date;
+    }
+
+    if full_start < full_end {
+        parts.full_start = Some(full_start);
+        parts.full_end = Some(full_end);
+    }
+
+    parts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2830,6 +3480,44 @@ mod tests {
             + (completion_tokens as f64 / 1_000_000.0) * completion_per_1m
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn record_turn_for_test(
+        storage: &Storage,
+        session_id: &str,
+        timestamp: DateTime<Utc>,
+        model: &str,
+        note: Option<&str>,
+        context_window: Option<u64>,
+        reasoning_effort: Option<&str>,
+        prompt_tokens: u64,
+        cached_prompt_tokens: u64,
+        completion_tokens: u64,
+        reasoning_tokens: u64,
+        total_tokens: u64,
+        message_id: Option<i64>,
+    ) {
+        let mut tx = storage.begin_tx().await.unwrap();
+        storage
+            .record_turn_tx(
+                &mut tx,
+                session_id,
+                timestamp,
+                model,
+                note,
+                context_window,
+                reasoning_effort,
+                prompt_tokens,
+                cached_prompt_tokens,
+                completion_tokens,
+                reasoning_tokens,
+                total_tokens,
+                message_id,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
     #[tokio::test]
     async fn record_turn_updates_daily_stats_and_costs() {
         let db_file = NamedTempFile::new().unwrap();
@@ -2840,13 +3528,23 @@ mod tests {
         seed_price(&storage, "gpt-test", day, 1.0, Some(0.5), 2.0).await;
 
         let ts = Utc.from_utc_datetime(&day.and_hms_opt(12, 0, 0).unwrap());
-        storage
-            .record_turn(
-                "sess-1", ts, "gpt-test", None, None, None, 1_000_000, 200_000, 300_000, 50_000,
-                1_300_000, None,
-            )
-            .await
-            .unwrap();
+        let local_day = ts.with_timezone(&Local).date_naive();
+        record_turn_for_test(
+            &storage,
+            "sess-1",
+            ts,
+            "gpt-test",
+            None,
+            None,
+            None,
+            1_000_000,
+            200_000,
+            300_000,
+            50_000,
+            1_300_000,
+            None,
+        )
+        .await;
 
         let row = sqlx::query(
             r#"
@@ -2855,7 +3553,7 @@ mod tests {
             WHERE date = ?
             "#,
         )
-        .bind(day.to_string())
+        .bind(local_day.to_string())
         .fetch_one(&*storage.pool)
         .await
         .unwrap();
@@ -2874,40 +3572,38 @@ mod tests {
         seed_price(&storage, "gpt-test", day, 1.0, None, 1.0).await;
 
         let base = Utc.from_utc_datetime(&day.and_hms_opt(12, 0, 0).unwrap());
-        storage
-            .record_turn(
-                "sess-a",
-                base - ChronoDuration::minutes(10),
-                "gpt-test",
-                None,
-                None,
-                None,
-                100_000,
-                0,
-                50_000,
-                0,
-                150_000,
-                None,
-            )
-            .await
-            .unwrap();
-        storage
-            .record_turn(
-                "sess-b",
-                base - ChronoDuration::minutes(5),
-                "gpt-test",
-                None,
-                None,
-                None,
-                300_000,
-                0,
-                50_000,
-                0,
-                350_000,
-                None,
-            )
-            .await
-            .unwrap();
+        record_turn_for_test(
+            &storage,
+            "sess-a",
+            base - ChronoDuration::minutes(10),
+            "gpt-test",
+            None,
+            None,
+            None,
+            100_000,
+            0,
+            50_000,
+            0,
+            150_000,
+            None,
+        )
+        .await;
+        record_turn_for_test(
+            &storage,
+            "sess-b",
+            base - ChronoDuration::minutes(5),
+            "gpt-test",
+            None,
+            None,
+            None,
+            300_000,
+            0,
+            50_000,
+            0,
+            350_000,
+            None,
+        )
+        .await;
 
         let rows = storage
             .sessions_page_by_cost_between(base - ChronoDuration::hours(1), base, 0, 10)
